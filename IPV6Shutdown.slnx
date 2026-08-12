@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="IPV6Shutdown.csproj" />
+  <Project Path="IPV6Shutdown.Tests/IPV6Shutdown.Tests.csproj" />
 </Solution>

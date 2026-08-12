@@ -447,41 +447,51 @@ namespace IPV6Shutdown
 
         private static void VerifyWatchdogTask()
         {
-            string result = RunPowerShell($$"""
+            string json = RunPowerShell($$"""
                 $ErrorActionPreference = 'Stop'
                 $task = Get-ScheduledTask -TaskName '{{WatchdogTaskName}}' -ErrorAction Stop
                 $trigger = $task.Triggers | Select-Object -First 1
                 if (-not $trigger) { throw "A tarefa '{{WatchdogTaskName}}' não possui trigger configurado." }
                 $rep = $trigger.Repetition
-                if ($rep.Interval -ne 'PT2M') { throw "Intervalo de repetição incorreto: esperado PT2M, obtido '$($rep.Interval)'." }
-                $duration = $rep.Duration
-                if ($duration -match 'P99999999|99999999') { throw "Duration inválido na tarefa agendada: '$duration'." }
-                'OK'
+                @{ Interval = [string]$rep.Interval; Duration = [string]$rep.Duration } | ConvertTo-Json -Compress
                 """);
-            if (!result.Contains("OK", StringComparison.Ordinal))
+            json = ExtractJsonPayload(json);
+            try
+            {
+                using JsonDocument doc = JsonDocument.Parse(json);
+                JsonElement root = doc.RootElement;
+                string interval = root.GetProperty("Interval").GetString() ?? string.Empty;
+                string duration = root.GetProperty("Duration").GetString() ?? string.Empty;
+                if (!WatchdogTaskValidation.IsWatchdogIntervalTwoMinutes(interval))
+                    throw new PowerShellException(PsError.ExitCode,
+                        $"Verificação do watchdog: intervalo de repetição incorreto (esperado 2 minutos, obtido '{interval}').");
+                if (WatchdogTaskValidation.IsIllegalWatchdogDuration(duration))
+                    throw new PowerShellException(PsError.ExitCode,
+                        $"Verificação do watchdog: duração inválida na tarefa agendada ('{duration}').");
+            }
+            catch (PowerShellException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is JsonException or KeyNotFoundException)
+            {
                 throw new PowerShellException(PsError.ExitCode,
-                    $"Verificação do watchdog falhou: a tarefa '{WatchdogTaskName}' não está configurada corretamente.");
+                    $"Verificação do watchdog falhou: resposta inválida do Agendador de Tarefas ({ex.Message}).", ex);
+            }
         }
 
         private static string EnhanceWatchdogInstallError(string message)
         {
-            if (IsInvalidTaskDurationError(message))
-                return $"Falha ao instalar a tarefa de proteção contínua (watchdog): o Agendador de Tarefas rejeitou o XML por Duration inválido ou fora do intervalo "
-                     + "(ex.: P99999999DT23H59M59S). Omita -RepetitionDuration para repetição indefinida no Windows 10+. "
-                     + $"Reexecute como Administrador. Detalhes: {message}";
+            if (WatchdogTaskValidation.IsInvalidTaskDurationError(message))
+                return "Não foi possível instalar a proteção contínua (tarefa agendada no Windows). "
+                     + "O Agendador de Tarefas rejeitou a configuração da tarefa — geralmente por um valor de duração inválido no XML da tarefa. "
+                     + "Baixe ou compile a versão mais recente do IPV6Shutdown e execute novamente como Administrador. "
+                     + $"Detalhes: {message}";
             if (message.Contains("acesso negado", StringComparison.OrdinalIgnoreCase)
                 || message.Contains("Access is denied", StringComparison.OrdinalIgnoreCase))
-                return $"Falha ao instalar o watchdog: permissão insuficiente. Reexecute o IPV6Shutdown como Administrador. Detalhes: {message}";
-            return $"Falha ao instalar a tarefa de proteção contínua (watchdog). Reexecute como Administrador se o problema persistir. Detalhes: {message}";
+                return $"Falha ao instalar a proteção contínua: permissão insuficiente. Execute o IPV6Shutdown como Administrador. Detalhes: {message}";
+            return $"Falha ao instalar a proteção contínua (tarefa agendada). Execute como Administrador se o problema persistir. Detalhes: {message}";
         }
-
-        private static bool IsInvalidTaskDurationError(string text) =>
-            text.Contains("P99999999", StringComparison.OrdinalIgnoreCase)
-            || (text.Contains("Duration", StringComparison.OrdinalIgnoreCase)
-                && (text.Contains("formatado incorretamente", StringComparison.OrdinalIgnoreCase)
-                    || text.Contains("fora do intervalo", StringComparison.OrdinalIgnoreCase)
-                    || text.Contains("incorrectly formatted", StringComparison.OrdinalIgnoreCase)
-                    || text.Contains("out of range", StringComparison.OrdinalIgnoreCase)));
 
         private static void Revert()
         {
@@ -682,7 +692,26 @@ namespace IPV6Shutdown
                     .Select(m => m.Groups[1].Value))
                 : stderr;
             clean = clean.Replace("_x000D__x000A_", " ").ReplaceLineEndings(" ").Trim();
-            return clean.Length > 300 ? clean[..300] + "…" : clean;
+            const int maxLen = 300;
+            if (clean.Length <= maxLen)
+                return clean;
+            if (WatchdogTaskValidation.IsInvalidTaskDurationError(clean))
+                return TruncatePreservingTokens(clean, maxLen, "P99999999", "Duration:");
+            return clean[..maxLen] + "…";
+        }
+
+        private static string TruncatePreservingTokens(string text, int maxLen, params string[] tokens)
+        {
+            foreach (string token in tokens)
+            {
+                int idx = text.IndexOf(token, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0)
+                    continue;
+                int start = Math.Max(0, idx - 40);
+                string slice = text[start..];
+                return slice.Length > maxLen ? slice[..maxLen] + "…" : slice;
+            }
+            return text[..maxLen] + "…";
         }
 
         private static string Truncate(string text, int max)
