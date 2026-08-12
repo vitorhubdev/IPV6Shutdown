@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.Versioning;
 using System.Security.Principal;
 using System.Text;
@@ -244,7 +245,14 @@ namespace IPV6Shutdown
         {
             AnsiConsole.Write(new FigletText("IPV6").Color(Color.Red).LeftJustified());
             AnsiConsole.Write(new Rule("[bold]IPV6 Shutdown — bloqueio total de IPv6[/]").RuleStyle("grey").LeftJustified());
+            AnsiConsole.MarkupLine($"[grey]v{Markup.Escape(GetAppVersion())}[/]");
             AnsiConsole.WriteLine();
+        }
+
+        private static string GetAppVersion()
+        {
+            Version? version = Assembly.GetExecutingAssembly().GetName().Version;
+            return version is null ? "1.1.0" : $"{version.Major}.{version.Minor}.{version.Build}";
         }
 
         private static void RenderStatus()
