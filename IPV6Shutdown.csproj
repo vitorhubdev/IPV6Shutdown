@@ -11,7 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="ChatGPT-Image-9-de-ago.-de-2026_-17_12_41.ico" />
+    <Content Include="logo.ico" />
   </ItemGroup>
 
   <ItemGroup>
