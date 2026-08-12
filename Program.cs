@@ -328,7 +328,7 @@ namespace IPV6Shutdown
                         $"New-NetFirewallRule -DisplayName '{RuleSaida}' -Direction Outbound -Action Block -RemoteAddress '{AllIpv6SemUla}' -Enabled True | Out-Null");
                     EnsureFirewallRule(RuleEntrada,
                         $"New-NetFirewallRule -DisplayName '{RuleEntrada}' -Direction Inbound -Action Block -RemoteAddress '{AllIpv6SemUla}' -Enabled True | Out-Null");
-                    InstallWatchdog(ctx);
+                    EnsureWatchdogInstalled(ctx);
                 }
             });
             AnsiConsole.MarkupLine("[green]✔ IPv6 desativado nas interfaces" + (noFirewall ? ".[/]" : " e bloqueado no firewall.[/]"));
@@ -405,6 +405,19 @@ namespace IPV6Shutdown
             AnsiConsole.WriteLine();
         }
 
+        private static void EnsureWatchdogInstalled(StatusContext? ctx)
+        {
+            try
+            {
+                InstallWatchdog(ctx);
+                VerifyWatchdogTask();
+            }
+            catch (PowerShellException ex)
+            {
+                throw new PowerShellException(PsError.ExitCode, EnhanceWatchdogInstallError(ex.Message), ex);
+            }
+        }
+
         private static void InstallWatchdog(StatusContext? ctx)
         {
             ctx?.Status("[grey]Instalando tarefa de proteção contínua (a cada 2 min)...[/]");
@@ -424,11 +437,51 @@ namespace IPV6Shutdown
                 """;
             string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
             RunPowerShell($"""
+                Unregister-ScheduledTask -TaskName '{WatchdogTaskName}' -Confirm:$false -ErrorAction SilentlyContinue
                 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}'
-                $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration ([TimeSpan]::MaxValue)
-                Register-ScheduledTask -TaskName '{WatchdogTaskName}' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+                $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)
+                $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+                Register-ScheduledTask -TaskName '{WatchdogTaskName}' -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
                 """);
         }
+
+        private static void VerifyWatchdogTask()
+        {
+            string result = RunPowerShell($$"""
+                $ErrorActionPreference = 'Stop'
+                $task = Get-ScheduledTask -TaskName '{{WatchdogTaskName}}' -ErrorAction Stop
+                $trigger = $task.Triggers | Select-Object -First 1
+                if (-not $trigger) { throw "A tarefa '{{WatchdogTaskName}}' não possui trigger configurado." }
+                $rep = $trigger.Repetition
+                if ($rep.Interval -ne 'PT2M') { throw "Intervalo de repetição incorreto: esperado PT2M, obtido '$($rep.Interval)'." }
+                $duration = $rep.Duration
+                if ($duration -match 'P99999999|99999999') { throw "Duration inválido na tarefa agendada: '$duration'." }
+                'OK'
+                """);
+            if (!result.Contains("OK", StringComparison.Ordinal))
+                throw new PowerShellException(PsError.ExitCode,
+                    $"Verificação do watchdog falhou: a tarefa '{WatchdogTaskName}' não está configurada corretamente.");
+        }
+
+        private static string EnhanceWatchdogInstallError(string message)
+        {
+            if (IsInvalidTaskDurationError(message))
+                return $"Falha ao instalar a tarefa de proteção contínua (watchdog): o Agendador de Tarefas rejeitou o XML por Duration inválido ou fora do intervalo "
+                     + "(ex.: P99999999DT23H59M59S). Omita -RepetitionDuration para repetição indefinida no Windows 10+. "
+                     + $"Reexecute como Administrador. Detalhes: {message}";
+            if (message.Contains("acesso negado", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("Access is denied", StringComparison.OrdinalIgnoreCase))
+                return $"Falha ao instalar o watchdog: permissão insuficiente. Reexecute o IPV6Shutdown como Administrador. Detalhes: {message}";
+            return $"Falha ao instalar a tarefa de proteção contínua (watchdog). Reexecute como Administrador se o problema persistir. Detalhes: {message}";
+        }
+
+        private static bool IsInvalidTaskDurationError(string text) =>
+            text.Contains("P99999999", StringComparison.OrdinalIgnoreCase)
+            || (text.Contains("Duration", StringComparison.OrdinalIgnoreCase)
+                && (text.Contains("formatado incorretamente", StringComparison.OrdinalIgnoreCase)
+                    || text.Contains("fora do intervalo", StringComparison.OrdinalIgnoreCase)
+                    || text.Contains("incorrectly formatted", StringComparison.OrdinalIgnoreCase)
+                    || text.Contains("out of range", StringComparison.OrdinalIgnoreCase)));
 
         private static void Revert()
         {
