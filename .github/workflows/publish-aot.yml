@@ -1,0 +1,100 @@
+name: Publish AOT
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+jobs:
+  publish:
+    name: AOT ${{ matrix.label }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            msvc_arch: x64
+            label: 64-bit
+          - rid: win-x86
+            msvc_arch: x86
+            label: 32-bit
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup MSVC (${{ matrix.msvc_arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Setup .NET 11
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "11.0.x"
+          dotnet-quality: preview
+
+      - name: Publish Native AOT (${{ matrix.rid }})
+        run: >
+          dotnet publish IPV6Shutdown.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained true
+          -p:PublishAot=true
+          -p:StripSymbols=true
+          -o "${{ github.workspace }}/publish/${{ matrix.rid }}"
+
+      - name: Stage ready-to-run exe
+        shell: pwsh
+        run: |
+          $src = Join-Path "${{ github.workspace }}" "publish/${{ matrix.rid }}/IPV6Shutdown.exe"
+          if (-not (Test-Path $src)) {
+            throw "AOT exe not found: $src"
+          }
+          $destDir = Join-Path "${{ github.workspace }}" "staging"
+          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+          $dest = Join-Path $destDir "IPV6Shutdown-${{ matrix.rid }}.exe"
+          Copy-Item $src $dest
+          Get-Item $dest | Select-Object Name, Length, LastWriteTime
+
+      - name: Upload ${{ matrix.label }} exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPV6Shutdown-${{ matrix.rid }}
+          path: staging/IPV6Shutdown-${{ matrix.rid }}.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download AOT exes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: IPV6Shutdown-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/IPV6Shutdown-*.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true
