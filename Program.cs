@@ -278,11 +278,7 @@ namespace IPV6Shutdown
             grid.AddRow("6to4", StateMarkup(extra.SixToFour));
             grid.AddRow("ISATAP", StateMarkup(extra.Isatap));
             grid.AddRow("IP-HTTPS", StateMarkup(extra.IpHttps));
-            grid.AddRow("DisabledComponents (registro)", extra.DisabledComponents == 255
-                ? "[green]0xFF — IPv6 desativado na pilha[/]"
-                : extra.DisabledComponents == 0
-                    ? "[red]não definido — IPv6 habilitado na pilha[/]"
-                    : $"[yellow]0x{extra.DisabledComponents:X2} — parcial[/]");
+            grid.AddRow("DisabledComponents (registro)", DisabledComponentsPolicy.FormatStatusMarkup(extra.DisabledComponents));
             grid.AddRow("Serviço IP Helper (iphlpsvc)", extra.IpHelper == "Stopped"
                 ? $"[green]Parado ({Markup.Escape(extra.IpHelperStart)})[/]"
                 : $"[red]{Markup.Escape(extra.IpHelper)} ({Markup.Escape(extra.IpHelperStart)})[/]");
@@ -316,6 +312,7 @@ namespace IPV6Shutdown
 
         private static void DisableStandard(bool noFirewall)
         {
+            bool preferIpv4RebootNeeded = false;
             AnsiConsole.Status().Spinner(Spinner.Known.Dots).Start("[bold]Desativando IPv6...[/]", ctx =>
             {
                 List<BindingInfo> toDisable = GetBindings().Where(b => b.Enabled && !IsTailscaleAdapter(b)).ToList();
@@ -329,6 +326,8 @@ namespace IPV6Shutdown
                         "Falha ao desativar IPv6 nas interfaces");
                 }
                 ProtectTailscale(ctx);
+                ctx.Status("[grey]Gravando Prefer IPv4 (DisabledComponents | 0x20)...[/]");
+                preferIpv4RebootNeeded = ApplyPreferIpv4Registry();
                 if (!noFirewall)
                 {
                     ctx.Status("[grey]Criando regras de firewall (IPv6 toda a faixa, exceto ULA do Tailscale)...[/]");
@@ -343,6 +342,12 @@ namespace IPV6Shutdown
             if (!noFirewall)
             {
                 AnsiConsole.MarkupLine($"[green]✔ Proteção contínua ativa — a tarefa '[bold]{WatchdogTaskName}[/]' reaplica o bloqueio a cada 2 minutos.[/]");
+            }
+            if (preferIpv4RebootNeeded)
+            {
+                AnsiConsole.Write(new Panel("[bold yellow]Prefer IPv4 (DisabledComponents 0x20) foi gravado no registro. Reinicie o computador para a pilha TCP/IP priorizar IPv4 em sites dual-stack.[/]")
+                    .Header("[bold]Prefer IPv4 aplicado[/]")
+                    .BorderColor(Color.Yellow));
             }
             AnsiConsole.WriteLine();
         }
@@ -528,12 +533,8 @@ namespace IPV6Shutdown
                     """);
 
                 ctx.Status("[grey]Restaurando registro DisabledComponents...[/]");
-                string check = RunPowerShell($"if (Get-ItemProperty '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue) {{ 'yes' }}");
-                if (check.Contains("yes", StringComparison.OrdinalIgnoreCase))
-                {
-                    RunPowerShell($"Remove-ItemProperty -Path '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue");
+                if (RevertPreferIpv4Registry())
                     rebootNeeded = true;
-                }
 
                 ctx.Status("[grey]Reativando serviço IP Helper...[/]");
                 RunPowerShell("Set-Service iphlpsvc -StartupType Manual; Start-Service iphlpsvc -ErrorAction SilentlyContinue");
@@ -838,6 +839,49 @@ namespace IPV6Shutdown
             }
         }
 
+        private static bool ApplyPreferIpv4Registry()
+        {
+            int current = ReadDisabledComponents();
+            (int newValue, bool newlySet) = DisabledComponentsPolicy.ApplyPreferIpv4(current);
+            if (!newlySet)
+                return false;
+            RunPowerShell($"Set-ItemProperty -Path '{RegPath}' -Name DisabledComponents -Value {newValue} -Type DWord");
+            return true;
+        }
+
+        private static bool RevertPreferIpv4Registry()
+        {
+            int current = ReadDisabledComponents();
+            if (!GetDisabledComponentsPropertyExists())
+                return false;
+
+            (int? newValue, bool removeProperty, bool changed) = DisabledComponentsPolicy.RevertPreferIpv4(current);
+            if (!changed)
+                return false;
+
+            if (removeProperty)
+                RunPowerShell($"Remove-ItemProperty -Path '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue");
+            else
+                RunPowerShell($"Set-ItemProperty -Path '{RegPath}' -Name DisabledComponents -Value {newValue!.Value} -Type DWord");
+            return true;
+        }
+
+        private static bool GetDisabledComponentsPropertyExists()
+        {
+            string check = RunPowerShell(
+                $"if (Get-ItemProperty '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue) {{ 'yes' }}");
+            return check.Contains("yes", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static int ReadDisabledComponents()
+        {
+            if (!GetDisabledComponentsPropertyExists())
+                return 0;
+            string raw = RunPowerShell(
+                $"(Get-ItemProperty '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue).DisabledComponents");
+            return int.TryParse(raw.Trim(), out int value) ? value : 0;
+        }
+
         private static void EnsureFirewallRule(string displayName, string createCommand)
         {
             RunPowerShell($"Remove-NetFirewallRule -DisplayName '{EscapePs(displayName)}' -ErrorAction SilentlyContinue; {createCommand}");
@@ -868,7 +912,8 @@ namespace IPV6Shutdown
             AnsiConsole.MarkupLine("[bold]Uso:[/] IPV6Shutdown [[opções]]");
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("  [grey](sem opções)[/]   Abre o menu interativo.");
-            AnsiConsole.MarkupLine("  [grey]--disable[/]      Desativa o IPv6 (bindings + firewall).");
+            AnsiConsole.MarkupLine("  [grey]--disable[/]      Desativa o IPv6 (bindings + firewall) e prefere IPv4 (0x20).");
+            AnsiConsole.MarkupLine("                 IPv6 da Tailscale preservado.");
             AnsiConsole.MarkupLine("  [grey]--full[/]         Modo completo: bindings + firewall + túneis de transição");
             AnsiConsole.MarkupLine("                 (Teredo/6to4/ISATAP/IP-HTTPS) + DisabledComponents=0xFF + IP Helper.");
             AnsiConsole.MarkupLine("  [grey]-e, --enable[/]   Reverte tudo: reativa o IPv6 e remove todos os bloqueios.");
