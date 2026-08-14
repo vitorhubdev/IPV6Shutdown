@@ -252,7 +252,7 @@ namespace IPV6Shutdown
         private static string GetAppVersion()
         {
             Version? version = Assembly.GetExecutingAssembly().GetName().Version;
-            return version is null ? "1.1.0" : $"{version.Major}.{version.Minor}.{version.Build}";
+            return version is null ? "1.2.0" : $"{version.Major}.{version.Minor}.{version.Build}";
         }
 
         private static void RenderStatus()
