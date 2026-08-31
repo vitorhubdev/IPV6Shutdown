@@ -27,7 +27,8 @@ namespace IPV6Shutdown
         private static readonly HashSet<string> KnownArgs = new(StringComparer.OrdinalIgnoreCase)
         {
             "-e", "--enable", "-s", "--status", "--full", "--disable",
-            "--nofirewall", "--pause", "-h", "--help", "/?"
+            "--nofirewall", "--pause", "-h", "--help", "/?",
+            "-w", "--warp-tailscale"
         };
 
         private static int Main(string[] args)
@@ -41,6 +42,7 @@ namespace IPV6Shutdown
             bool disable = args.Any(a => a is "--disable");
             bool noFirewall = args.Any(a => a is "--nofirewall");
             bool pause = args.Any(a => a is "--pause");
+            bool warpTailscale = args.Any(a => a is "-w" or "--warp-tailscale");
 
             if (args.Any(a => a is "-h" or "--help" or "/?"))
             {
@@ -71,6 +73,11 @@ namespace IPV6Shutdown
             {
                 if (statusOnly)
                 {
+                    RenderStatus();
+                }
+                else if (warpTailscale)
+                {
+                    FixWarpTailscaleStandalone();
                     RenderStatus();
                 }
                 else if (enable)
@@ -147,6 +154,20 @@ namespace IPV6Shutdown
                     AnsiConsole.MarkupLine("[grey]Nota: as interfaces do Tailscale mantêm o IPv6 ativo (faixa privada fd7a:115c:a1e0::/48) — necessário para o tailnet funcionar.[/]");
                     AnsiConsole.WriteLine();
 
+                    var choices = new List<string>
+                    {
+                        "Desativar IPv6 (bindings + firewall — Tailscale preservado)",
+                        "Modo FULL (bindings + firewall + túneis + registro + IP Helper — Tailscale preservado)"
+                    };
+
+                    if (HasTailscale() && HasCloudflareWarp())
+                    {
+                        choices.Add("Corrigir DNS Cloudflare WARP + Tailscale (fallback *.ts.net)");
+                    }
+
+                    choices.Add("Reverter tudo (reativar IPv6 e desfazer bloqueios)");
+                    choices.Add("Sair");
+
                     string choice;
                     try
                     {
@@ -154,11 +175,7 @@ namespace IPV6Shutdown
                             new SelectionPrompt<string>()
                                 .Title("[bold]O que deseja fazer?[/]")
                                 .HighlightStyle(new Style(Color.Red))
-                                .AddChoices(
-                                    "Desativar IPv6 (bindings + firewall — Tailscale preservado)",
-                                    "Modo FULL (bindings + firewall + túneis + registro + IP Helper — Tailscale preservado)",
-                                    "Reverter tudo (reativar IPv6 e desfazer bloqueios)",
-                                    "Sair"));
+                                .AddChoices(choices));
                     }
                     catch (OperationCanceledException)
                     {
@@ -181,6 +198,8 @@ namespace IPV6Shutdown
                         DisableStandard(noFirewall: false);
                     else if (choice.StartsWith("Modo FULL", StringComparison.Ordinal))
                         DisableFull(noFirewall: false);
+                    else if (choice.StartsWith("Corrigir DNS", StringComparison.Ordinal))
+                        FixWarpTailscaleStandalone();
                     else
                         Revert();
 
@@ -288,6 +307,10 @@ namespace IPV6Shutdown
             grid.AddRow("Watchdog (proteção contínua)", extra.Watchdog
                 ? "[green]ativa — a cada 2 min[/]"
                 : "[red]ausente[/]");
+            if (HasTailscale() || HasCloudflareWarp())
+            {
+                grid.AddRow("Cloudflare WARP + Tailscale DNS", GetWarpTailscaleStatus());
+            }
             AnsiConsole.Write(grid);
 
             AnsiConsole.WriteLine();
@@ -313,6 +336,7 @@ namespace IPV6Shutdown
         private static void DisableStandard(bool noFirewall)
         {
             bool preferIpv4RebootNeeded = false;
+            bool warpConflictFixed = false;
             AnsiConsole.Status().Spinner(Spinner.Known.Dots).Start("[bold]Desativando IPv6...[/]", ctx =>
             {
                 List<BindingInfo> toDisable = GetBindings().Where(b => b.Enabled && !IsTailscaleAdapter(b)).ToList();
@@ -328,6 +352,10 @@ namespace IPV6Shutdown
                 ProtectTailscale(ctx);
                 ctx.Status("[grey]Gravando Prefer IPv4 (DisabledComponents | 0x20)...[/]");
                 preferIpv4RebootNeeded = ApplyPreferIpv4Registry();
+                if (HasTailscale() && HasCloudflareWarp())
+                {
+                    EnsureWarpTailscaleFallback(ctx, out warpConflictFixed);
+                }
                 if (!noFirewall)
                 {
                     ctx.Status("[grey]Criando regras de firewall (IPv6 toda a faixa, exceto ULA do Tailscale)...[/]");
@@ -339,6 +367,10 @@ namespace IPV6Shutdown
                 }
             });
             AnsiConsole.MarkupLine("[green]✔ IPv6 desativado nas interfaces" + (noFirewall ? ".[/]" : " e bloqueado no firewall.[/]"));
+            if (HasTailscale() && HasCloudflareWarp())
+            {
+                AnsiConsole.MarkupLine("[green]✔ Conflito Cloudflare WARP + Tailscale MagicDNS resolvido (fallback *.ts.net ativo).[/]");
+            }
             if (!noFirewall)
             {
                 AnsiConsole.MarkupLine($"[green]✔ Proteção contínua ativa — a tarefa '[bold]{WatchdogTaskName}[/]' reaplica o bloqueio a cada 2 minutos.[/]");
@@ -891,7 +923,128 @@ namespace IPV6Shutdown
             b.Name.Contains("Tailscale", StringComparison.OrdinalIgnoreCase) ||
             b.Description.Contains("Tailscale", StringComparison.OrdinalIgnoreCase);
 
-        private static bool HasTailscale() => GetBindings().Any(IsTailscaleAdapter);
+        private static bool HasTailscale() =>
+            GetBindings().Any(IsTailscaleAdapter) ||
+            File.Exists(@"C:\Program Files\Tailscale\tailscale.exe") ||
+            File.Exists(@"C:\Program Files (x86)\Tailscale\tailscale.exe");
+
+        private static string? GetWarpCliPath()
+        {
+            string defaultPath = @"C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe";
+            if (File.Exists(defaultPath))
+                return defaultPath;
+
+            string localAppData = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                @"Cloudflare\Cloudflare WARP\warp-cli.exe");
+            if (File.Exists(localAppData))
+                return localAppData;
+
+            return null;
+        }
+
+        private static bool HasCloudflareWarp() => GetWarpCliPath() != null;
+
+        private static bool EnsureWarpTailscaleFallback(StatusContext? ctx, out bool changed)
+        {
+            changed = false;
+            if (!HasTailscale() || !HasCloudflareWarp())
+                return false;
+
+            string? warpCli = GetWarpCliPath();
+            if (warpCli == null)
+                return false;
+
+            ctx?.Status("[grey]Verificando integração Cloudflare WARP + Tailscale MagicDNS...[/]");
+            string listOutput = RunPowerShell($"& '{EscapePs(warpCli)}' dns fallback list");
+
+            if (!listOutput.Contains("ts.net", StringComparison.OrdinalIgnoreCase))
+            {
+                ctx?.Status("[grey]Adicionando fallback 'ts.net' (*.ts.net) no Cloudflare WARP...[/]");
+                RunPowerShell($"& '{EscapePs(warpCli)}' dns fallback add ts.net");
+                changed = true;
+            }
+
+            // Tenta descobrir o sufixo específico da tailnet atual para garantir resolução completa
+            try
+            {
+                string tsStatus = RunPowerShell("tailscale status --json -ErrorAction SilentlyContinue");
+                if (!string.IsNullOrWhiteSpace(tsStatus) && tsStatus.Contains("MagicDNSSuffix", StringComparison.OrdinalIgnoreCase))
+                {
+                    using JsonDocument doc = JsonDocument.Parse(ExtractJsonPayload(tsStatus));
+                    if (doc.RootElement.TryGetProperty("MagicDNSSuffix", out JsonElement suffixEl))
+                    {
+                        string? suffix = suffixEl.GetString()?.Trim().TrimEnd('.');
+                        if (!string.IsNullOrWhiteSpace(suffix) && !listOutput.Contains(suffix, StringComparison.OrdinalIgnoreCase))
+                        {
+                            ctx?.Status($"[grey]Adicionando fallback '{Markup.Escape(suffix)}' no Cloudflare WARP...[/]");
+                            RunPowerShell($"& '{EscapePs(warpCli)}' dns fallback add {EscapePs(suffix)}");
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // ts.net já cobre *.ts.net universalmente
+            }
+
+            if (changed)
+            {
+                RunPowerShell("ipconfig /flushdns");
+            }
+
+            return true;
+        }
+
+        private static void FixWarpTailscaleStandalone()
+        {
+            AnsiConsole.Status().Spinner(Spinner.Known.Dots).Start("[bold]Configurando integração Cloudflare WARP + Tailscale...[/]", ctx =>
+            {
+                if (!HasTailscale())
+                {
+                    AnsiConsole.MarkupLine("[yellow]Tailscale não foi detectado neste computador.[/]");
+                    return;
+                }
+                if (!HasCloudflareWarp())
+                {
+                    AnsiConsole.MarkupLine("[yellow]Cloudflare WARP não foi detectado neste computador.[/]");
+                    return;
+                }
+                EnsureWarpTailscaleFallback(ctx, out bool changed);
+                if (changed)
+                    AnsiConsole.MarkupLine("[green]✔ Fallback de DNS para todas as redes Tailscale (*.ts.net + ts.net) adicionado com sucesso no Cloudflare WARP.[/]");
+                else
+                    AnsiConsole.MarkupLine("[green]✔ O fallback para Tailscale (*.ts.net + ts.net) já está ativo e configurado no Cloudflare WARP.[/]");
+            });
+            AnsiConsole.WriteLine();
+        }
+
+        private static string GetWarpTailscaleStatus()
+        {
+            if (!HasTailscale() && !HasCloudflareWarp())
+                return "[grey]não detectados[/]";
+            if (!HasTailscale())
+                return "[grey]Tailscale ausente[/]";
+            if (!HasCloudflareWarp())
+                return "[grey]Cloudflare WARP ausente[/]";
+
+            string? warpCli = GetWarpCliPath();
+            if (warpCli == null)
+                return "[grey]WARP CLI ausente[/]";
+
+            try
+            {
+                string listOutput = RunPowerShell($"& '{EscapePs(warpCli)}' dns fallback list");
+                if (listOutput.Contains("ts.net", StringComparison.OrdinalIgnoreCase))
+                    return "[green]Ativo (*.ts.net liberado no WARP)[/]";
+                return "[yellow]Pendente (conflito — falta ts.net)[/]";
+            }
+            catch
+            {
+                return "[red]Erro ao consultar WARP[/]";
+            }
+        }
 
         private static bool ProtectTailscale(StatusContext? ctx)
         {
@@ -911,23 +1064,27 @@ namespace IPV6Shutdown
             RenderHeader();
             AnsiConsole.MarkupLine("[bold]Uso:[/] IPV6Shutdown [[opções]]");
             AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine("  [grey](sem opções)[/]   Abre o menu interativo.");
-            AnsiConsole.MarkupLine("  [grey]--disable[/]      Desativa o IPv6 (bindings + firewall) e prefere IPv4 (0x20).");
-            AnsiConsole.MarkupLine("                 IPv6 da Tailscale preservado.");
-            AnsiConsole.MarkupLine("  [grey]--full[/]         Modo completo: bindings + firewall + túneis de transição");
-            AnsiConsole.MarkupLine("                 (Teredo/6to4/ISATAP/IP-HTTPS) + DisabledComponents=0xFF + IP Helper.");
-            AnsiConsole.MarkupLine("  [grey]-e, --enable[/]   Reverte tudo: reativa o IPv6 e remove todos os bloqueios.");
-            AnsiConsole.MarkupLine("  [grey]-s, --status[/]   Apenas mostra o status (não precisa de Administrador).");
-            AnsiConsole.MarkupLine("  [grey]--nofirewall[/]   Não cria regras de firewall.");
-            AnsiConsole.MarkupLine("  [grey]Watchdog[/]       Ao desativar, instala a tarefa agendada 'IPV6Shutdown-Watchdog'");
-            AnsiConsole.MarkupLine("                 (a cada 2 min, como SYSTEM): se o WARP ou outro adaptador novo");
-            AnsiConsole.MarkupLine("                 reabilitar o IPv6, o binding é rebloqueado automaticamente.");
-            AnsiConsole.MarkupLine("                 Removida no 'Reverter tudo'.");
-            AnsiConsole.MarkupLine("  [grey]Tailscale[/]       As interfaces do Tailscale são sempre protegidas: o IPv6 privado");
-            AnsiConsole.MarkupLine("                 (fd7a:115c:a1e0::/48) do tailnet não é desativado, e no modo FULL");
-            AnsiConsole.MarkupLine("                 o DisabledComponents=0xFF e o IP Helper são pulados (o Tailscale");
-            AnsiConsole.MarkupLine("                 depende do serviço iphlpsvc).");
-            AnsiConsole.MarkupLine("  [grey]-h, --help[/]     Mostra esta ajuda.");
+            AnsiConsole.MarkupLine("  [grey](sem opções)[/]       Abre o menu interativo.");
+            AnsiConsole.MarkupLine("  [grey]--disable[/]          Desativa o IPv6 (bindings + firewall) e prefere IPv4 (0x20).");
+            AnsiConsole.MarkupLine("                     IPv6 da Tailscale preservado.");
+            AnsiConsole.MarkupLine("  [grey]--full[/]             Modo completo: bindings + firewall + túneis de transição");
+            AnsiConsole.MarkupLine("                     (Teredo/6to4/ISATAP/IP-HTTPS) + DisabledComponents=0xFF + IP Helper.");
+            AnsiConsole.MarkupLine("  [grey]-w, --warp-tailscale[/] Resolve conflito Cloudflare WARP + Tailscale: adiciona o fallback");
+            AnsiConsole.MarkupLine("                     de DNS (*.ts.net + ts.net) no WARP para o MagicDNS funcionar.");
+            AnsiConsole.MarkupLine("  [grey]-e, --enable[/]       Reverte tudo: reativa o IPv6 e remove todos os bloqueios.");
+            AnsiConsole.MarkupLine("  [grey]-s, --status[/]       Apenas mostra o status (não precisa de Administrador).");
+            AnsiConsole.MarkupLine("  [grey]--nofirewall[/]       Não cria regras de firewall.");
+            AnsiConsole.MarkupLine("  [grey]Watchdog[/]           Ao desativar, instala a tarefa agendada 'IPV6Shutdown-Watchdog'");
+            AnsiConsole.MarkupLine("                     (a cada 2 min, como SYSTEM): se o WARP ou outro adaptador novo");
+            AnsiConsole.MarkupLine("                     reabilitar o IPv6, o binding é rebloqueado automaticamente.");
+            AnsiConsole.MarkupLine("                     Removida no 'Reverter tudo'.");
+            AnsiConsole.MarkupLine("  [grey]Tailscale[/]           As interfaces do Tailscale são sempre protegidas: o IPv6 privado");
+            AnsiConsole.MarkupLine("                     (fd7a:115c:a1e0::/48) do tailnet não é desativado, e no modo FULL");
+            AnsiConsole.MarkupLine("                     o DisabledComponents=0xFF e o IP Helper são pulados (o Tailscale");
+            AnsiConsole.MarkupLine("                     depende do serviço iphlpsvc).");
+            AnsiConsole.MarkupLine("  [grey]WARP + Tailscale[/]    Se ambos estiverem instalados, o fallback para *.ts.net e ts.net");
+            AnsiConsole.MarkupLine("                     é configurado automaticamente no Cloudflare WARP, liberando o MagicDNS.");
+            AnsiConsole.MarkupLine("  [grey]-h, --help[/]         Mostra esta ajuda.");
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("  [grey]Códigos de saída:[/] 101 (PS não encontrado) · 102 (timeout) · 103 (comando falhou) · 199 (erro inesperado)");
             AnsiConsole.WriteLine();
