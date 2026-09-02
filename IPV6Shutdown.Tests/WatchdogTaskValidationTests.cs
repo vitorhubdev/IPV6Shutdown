@@ -2,6 +2,7 @@ namespace IPV6Shutdown.Tests
 {
     using IPV6Shutdown;
     using Xunit;
+
     public class WatchdogTaskValidationTests
     {
         [Theory]
@@ -48,5 +49,76 @@ namespace IPV6Shutdown.Tests
                 "Duration:P99999999DT23H59M59S formatado incorretamente"));
             Assert.False(WatchdogTaskValidation.IsInvalidTaskDurationError("comando genérico falhou"));
         }
+
+        [Fact]
+        public void EvaluateConfiguration_accepts_boot_periodic_system_task()
+        {
+            WatchdogConfigurationResult result =
+                WatchdogTaskValidation.EvaluateConfiguration(HealthySnapshot());
+
+            Assert.Equal(WatchdogConfigurationState.Healthy, result.State);
+        }
+
+        [Fact]
+        public void EvaluateConfiguration_rejects_missing_task()
+        {
+            WatchdogTaskSnapshot snapshot = HealthySnapshot() with { Exists = false };
+            Assert.Equal(WatchdogConfigurationState.Missing,
+                WatchdogTaskValidation.EvaluateConfiguration(snapshot).State);
+        }
+
+        [Fact]
+        public void EvaluateConfiguration_rejects_disabled_task()
+        {
+            WatchdogTaskSnapshot snapshot = HealthySnapshot() with { Enabled = false };
+            Assert.Equal(WatchdogConfigurationState.Disabled,
+                WatchdogTaskValidation.EvaluateConfiguration(snapshot).State);
+        }
+
+        [Fact]
+        public void EvaluateConfiguration_requires_startup_trigger()
+        {
+            WatchdogConfigurationResult result = WatchdogTaskValidation.EvaluateConfiguration(
+                HealthySnapshot() with { HasStartupTrigger = false });
+
+            Assert.Equal(WatchdogConfigurationState.Invalid, result.State);
+            Assert.Contains("inicialização", result.Reason);
+        }
+
+        [Fact]
+        public void EvaluateConfiguration_requires_start_when_available()
+        {
+            WatchdogConfigurationResult result = WatchdogTaskValidation.EvaluateConfiguration(
+                HealthySnapshot() with { StartWhenAvailable = false });
+
+            Assert.Equal(WatchdogConfigurationState.Invalid, result.State);
+            Assert.Contains("StartWhenAvailable", result.Reason);
+        }
+
+        [Fact]
+        public void EvaluateConfiguration_requires_system_highest_powershell()
+        {
+            Assert.Equal(WatchdogConfigurationState.Invalid,
+                WatchdogTaskValidation.EvaluateConfiguration(
+                    HealthySnapshot() with { UserId = "usuario" }).State);
+            Assert.Equal(WatchdogConfigurationState.Invalid,
+                WatchdogTaskValidation.EvaluateConfiguration(
+                    HealthySnapshot() with { RunLevel = "Limited" }).State);
+            Assert.Equal(WatchdogConfigurationState.Invalid,
+                WatchdogTaskValidation.EvaluateConfiguration(
+                    HealthySnapshot() with { ActionExecute = "cmd.exe" }).State);
+        }
+
+        private static WatchdogTaskSnapshot HealthySnapshot() => new(
+            Exists: true,
+            Enabled: true,
+            HasStartupTrigger: true,
+            Interval: "PT2M",
+            Duration: "",
+            StartWhenAvailable: true,
+            UserId: "SYSTEM",
+            RunLevel: "Highest",
+            ActionExecute: "powershell.exe",
+            ActionArguments: "-NoProfile -EncodedCommand AAAA");
     }
 }

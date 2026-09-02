@@ -39,7 +39,7 @@ Sites dual-stack (ex.: com registro A e AAAA) continuam acessíveis via IPv4 qua
 
 - Desativa binding `ms_tcpip6` em adaptadores (exceto Tailscale)
 - Regras de firewall IPv6 entrada/saída (exceto ULA Tailscale)
-- Tarefa agendada `IPV6Shutdown-Watchdog` (SYSTEM, Highest) a cada 2 min
+- Tarefa agendada `IPV6Shutdown-Watchdog` (SYSTEM, Highest) no boot + a cada 2 min, com recuperação de execuções perdidas
 - **Prefer IPv4** (`DisabledComponents | 0x20`) no `--disable` — sem `0xFF` aqui
 - Modo **FULL** (`--full`): túneis de transição, `0xFF` e IP Helper (se sem Tailscale)
 - Reversão completa com `-e` / `--enable`
@@ -96,7 +96,7 @@ IPV6Shutdown.exe -s
 
 1. **Bindings** — `Disable-NetAdapterBinding` em `ms_tcpip6`, exceto adaptadores Tailscale
 2. **Firewall** — bloqueia IPv6 entrada/saída exceto ULA Tailscale (`AllIpv6SemUla` no código)
-3. **Watchdog** — tarefa `IPV6Shutdown-Watchdog` a cada 2 min como SYSTEM (Highest); reaplica bindings + firewall se WARP ou novo adaptador reabilitar IPv6
+3. **Watchdog** — tarefa `IPV6Shutdown-Watchdog` como SYSTEM (Highest), com trigger no boot + reconciliação a cada 2 min e `StartWhenAvailable`; reaplica bindings + firewall se WARP, reboot, atualização de driver ou novo adaptador reabilitar IPv6
 4. **Prefer IPv4** — grava `DisabledComponents = current | 0x20` (não usa `0xFF` aqui). **Reinício recomendado** para a pilha TCP/IP aplicar plenamente. Evita que sites dual-stack “travem” quando o DNS devolve AAAA mas IPv6 está bloqueado/desvinculado
 
 ### `--full`

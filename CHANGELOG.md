@@ -5,6 +5,19 @@ Todas as alterações notáveis neste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [1.3.1] - 2026-09-02
+
+### Corrigido
+- Watchdog agora possui trigger explícito no boot além da reconciliação a cada 2 minutos.
+- `StartWhenAvailable` habilitado para recuperar execuções temporais perdidas após desligamento/reinício.
+- Status do watchdog valida configuração real (estado, triggers, principal SYSTEM, RunLevel e ação) em vez de considerar apenas a existência da tarefa.
+- Descoberta de `MagicDNSSuffix` usa o CLI nativo do Tailscale sem parâmetros inválidos do PowerShell.
+
+### Alterado
+- CI executa a suíte de testes antes de publicar binários Native AOT.
+
+---
+
 ## [1.3.0] - 2026-08-31
 
 ### Adicionado

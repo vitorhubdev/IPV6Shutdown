@@ -271,7 +271,7 @@ namespace IPV6Shutdown
         private static string GetAppVersion()
         {
             Version? version = Assembly.GetExecutingAssembly().GetName().Version;
-            return version is null ? "1.2.0" : $"{version.Major}.{version.Minor}.{version.Build}";
+            return version is null ? "1.3.1" : $"{version.Major}.{version.Minor}.{version.Build}";
         }
 
         private static void RenderStatus()
@@ -304,9 +304,7 @@ namespace IPV6Shutdown
             grid.AddRow("Regras de firewall IPV6Shutdown", extra.FirewallRules == 0
                 ? "[red]nenhuma[/]"
                 : $"[green]{extra.FirewallRules} regra(s) ativa(s)[/]");
-            grid.AddRow("Watchdog (proteção contínua)", extra.Watchdog
-                ? "[green]ativa — a cada 2 min[/]"
-                : "[red]ausente[/]");
+            grid.AddRow("Watchdog (proteção contínua)", GetWatchdogStatusMarkup());
             if (HasTailscale() || HasCloudflareWarp())
             {
                 grid.AddRow("Cloudflare WARP + Tailscale DNS", GetWarpTailscaleStatus());
@@ -373,7 +371,7 @@ namespace IPV6Shutdown
             }
             if (!noFirewall)
             {
-                AnsiConsole.MarkupLine($"[green]✔ Proteção contínua ativa — a tarefa '[bold]{WatchdogTaskName}[/]' reaplica o bloqueio a cada 2 minutos.[/]");
+                AnsiConsole.MarkupLine($"[green]✔ Proteção contínua ativa — a tarefa '[bold]{WatchdogTaskName}[/]' reaplica no boot e a cada 2 minutos.[/]");
             }
             if (preferIpv4RebootNeeded)
             {
@@ -484,44 +482,126 @@ namespace IPV6Shutdown
             RunPowerShell($"""
                 Unregister-ScheduledTask -TaskName '{WatchdogTaskName}' -Confirm:$false -ErrorAction SilentlyContinue
                 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}'
-                $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)
-                $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-                Register-ScheduledTask -TaskName '{WatchdogTaskName}' -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+                $startupTrigger = New-ScheduledTaskTrigger -AtStartup
+                $periodicTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)
+                $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+                Register-ScheduledTask -TaskName '{WatchdogTaskName}' -Action $action -Trigger @($startupTrigger, $periodicTrigger) -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
                 """);
         }
 
         private static void VerifyWatchdogTask()
         {
+            WatchdogConfigurationResult result =
+                WatchdogTaskValidation.EvaluateConfiguration(GetWatchdogTaskSnapshot());
+
+            if (result.State != WatchdogConfigurationState.Healthy)
+            {
+                throw new PowerShellException(PsError.ExitCode,
+                    $"Verificação do watchdog falhou: {result.Reason}");
+            }
+        }
+
+        private static WatchdogTaskSnapshot GetWatchdogTaskSnapshot()
+        {
             string json = RunPowerShell($$"""
                 $ErrorActionPreference = 'Stop'
-                $task = Get-ScheduledTask -TaskName '{{WatchdogTaskName}}' -ErrorAction Stop
-                $trigger = $task.Triggers | Select-Object -First 1
-                if (-not $trigger) { throw "A tarefa '{{WatchdogTaskName}}' não possui trigger configurado." }
-                $rep = $trigger.Repetition
-                @{ Interval = [string]$rep.Interval; Duration = [string]$rep.Duration } | ConvertTo-Json -Compress
+                $task = Get-ScheduledTask -TaskName '{{WatchdogTaskName}}' -ErrorAction SilentlyContinue
+
+                if ($null -eq $task) {
+                    [ordered]@{
+                        Exists = $false
+                        Enabled = $false
+                        HasStartupTrigger = $false
+                        Interval = ''
+                        Duration = ''
+                        StartWhenAvailable = $false
+                        UserId = ''
+                        RunLevel = ''
+                        ActionExecute = ''
+                        ActionArguments = ''
+                    } | ConvertTo-Json -Compress
+                    return
+                }
+
+                $triggers = @($task.Triggers)
+                $periodic = $triggers | Where-Object {
+                    $_.Repetition -and -not [string]::IsNullOrWhiteSpace([string]$_.Repetition.Interval)
+                } | Select-Object -First 1
+                $hasStartup = @($triggers | Where-Object {
+                    $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger'
+                }).Count -gt 0
+
+                $interval = ''
+                $duration = ''
+                if ($periodic) {
+                    $interval = [string]$periodic.Repetition.Interval
+                    $duration = [string]$periodic.Repetition.Duration
+                }
+
+                $action = $task.Actions | Select-Object -First 1
+                $actionExecute = if ($action) { [string]$action.Execute } else { '' }
+                $actionArguments = if ($action) { [string]$action.Arguments } else { '' }
+
+                [ordered]@{
+                    Exists = $true
+                    Enabled = ([string]$task.State -ne 'Disabled')
+                    HasStartupTrigger = [bool]$hasStartup
+                    Interval = $interval
+                    Duration = $duration
+                    StartWhenAvailable = [bool]$task.Settings.StartWhenAvailable
+                    UserId = [string]$task.Principal.UserId
+                    RunLevel = [string]$task.Principal.RunLevel
+                    ActionExecute = $actionExecute
+                    ActionArguments = $actionArguments
+                } | ConvertTo-Json -Compress
                 """);
+
             json = ExtractJsonPayload(json);
             try
             {
                 using JsonDocument doc = JsonDocument.Parse(json);
                 JsonElement root = doc.RootElement;
-                string interval = root.GetProperty("Interval").GetString() ?? string.Empty;
-                string duration = root.GetProperty("Duration").GetString() ?? string.Empty;
-                if (!WatchdogTaskValidation.IsWatchdogIntervalTwoMinutes(interval))
-                    throw new PowerShellException(PsError.ExitCode,
-                        $"Verificação do watchdog: intervalo de repetição incorreto (esperado 2 minutos, obtido '{interval}').");
-                if (WatchdogTaskValidation.IsIllegalWatchdogDuration(duration))
-                    throw new PowerShellException(PsError.ExitCode,
-                        $"Verificação do watchdog: duração inválida na tarefa agendada ('{duration}').");
+                return new WatchdogTaskSnapshot(
+                    root.GetProperty("Exists").GetBoolean(),
+                    root.GetProperty("Enabled").GetBoolean(),
+                    root.GetProperty("HasStartupTrigger").GetBoolean(),
+                    root.GetProperty("Interval").GetString() ?? string.Empty,
+                    root.GetProperty("Duration").GetString() ?? string.Empty,
+                    root.GetProperty("StartWhenAvailable").GetBoolean(),
+                    root.GetProperty("UserId").GetString() ?? string.Empty,
+                    root.GetProperty("RunLevel").GetString() ?? string.Empty,
+                    root.GetProperty("ActionExecute").GetString() ?? string.Empty,
+                    root.GetProperty("ActionArguments").GetString() ?? string.Empty);
             }
-            catch (PowerShellException)
-            {
-                throw;
-            }
-            catch (Exception ex) when (ex is JsonException or KeyNotFoundException)
+            catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
             {
                 throw new PowerShellException(PsError.ExitCode,
                     $"Verificação do watchdog falhou: resposta inválida do Agendador de Tarefas ({ex.Message}).", ex);
+            }
+        }
+
+        private static string GetWatchdogStatusMarkup()
+        {
+            try
+            {
+                WatchdogConfigurationResult result =
+                    WatchdogTaskValidation.EvaluateConfiguration(GetWatchdogTaskSnapshot());
+
+                return result.State switch
+                {
+                    WatchdogConfigurationState.Healthy =>
+                        "[green]ativa — boot + a cada 2 min[/]",
+                    WatchdogConfigurationState.Missing =>
+                        "[red]ausente[/]",
+                    WatchdogConfigurationState.Disabled =>
+                        "[red]desativada no Agendador de Tarefas[/]",
+                    _ =>
+                        $"[yellow]configuração inválida — {Markup.Escape(result.Reason)}[/]"
+                };
+            }
+            catch (PowerShellException ex)
+            {
+                return $"[red]erro ao consultar — {Markup.Escape(ex.Message)}[/]";
             }
         }
 
@@ -843,7 +923,6 @@ namespace IPV6Shutdown
                   IpHelper = "$((Get-Service iphlpsvc).Status)"
                   IpHelperStart = "$((Get-Service iphlpsvc).StartType)"
                   FirewallRules = @(Get-NetFirewallRule -DisplayName 'IPV6Shutdown*' -ErrorAction SilentlyContinue).Count
-                  Watchdog = (Get-ScheduledTask -TaskName 'IPV6Shutdown-Watchdog' -ErrorAction SilentlyContinue) -ne $null
                 }
                 $o | ConvertTo-Json -Compress
                 """);
@@ -861,8 +940,7 @@ namespace IPV6Shutdown
                     dc.ValueKind == JsonValueKind.Number && dc.TryGetInt32(out int disabledComponentsValue) ? disabledComponentsValue : 0,
                     r.GetProperty("IpHelper").GetString() ?? "?",
                     r.GetProperty("IpHelperStart").GetString() ?? "?",
-                    r.GetProperty("FirewallRules").GetInt32(),
-                    r.GetProperty("Watchdog").GetBoolean());
+                    r.GetProperty("FirewallRules").GetInt32());
             }
             catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
             {
@@ -923,10 +1001,18 @@ namespace IPV6Shutdown
             b.Name.Contains("Tailscale", StringComparison.OrdinalIgnoreCase) ||
             b.Description.Contains("Tailscale", StringComparison.OrdinalIgnoreCase);
 
+        private static string? GetTailscaleCliPath()
+        {
+            string[] candidates =
+            [
+                @"C:\Program Files\Tailscale\tailscale.exe",
+                @"C:\Program Files (x86)\Tailscale\tailscale.exe"
+            ];
+            return candidates.FirstOrDefault(File.Exists);
+        }
+
         private static bool HasTailscale() =>
-            GetBindings().Any(IsTailscaleAdapter) ||
-            File.Exists(@"C:\Program Files\Tailscale\tailscale.exe") ||
-            File.Exists(@"C:\Program Files (x86)\Tailscale\tailscale.exe");
+            GetBindings().Any(IsTailscaleAdapter) || GetTailscaleCliPath() != null;
 
         private static string? GetWarpCliPath()
         {
@@ -968,7 +1054,10 @@ namespace IPV6Shutdown
             // Tenta descobrir o sufixo específico da tailnet atual para garantir resolução completa
             try
             {
-                string tsStatus = RunPowerShell("tailscale status --json -ErrorAction SilentlyContinue");
+                string? tailscaleCli = GetTailscaleCliPath();
+                string tsStatus = tailscaleCli == null
+                    ? string.Empty
+                    : RunPowerShell($"& '{EscapePs(tailscaleCli)}' status --json; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}");
                 if (!string.IsNullOrWhiteSpace(tsStatus) && tsStatus.Contains("MagicDNSSuffix", StringComparison.OrdinalIgnoreCase))
                 {
                     using JsonDocument doc = JsonDocument.Parse(ExtractJsonPayload(tsStatus));
@@ -1075,7 +1164,7 @@ namespace IPV6Shutdown
             AnsiConsole.MarkupLine("  [grey]-s, --status[/]       Apenas mostra o status (não precisa de Administrador).");
             AnsiConsole.MarkupLine("  [grey]--nofirewall[/]       Não cria regras de firewall.");
             AnsiConsole.MarkupLine("  [grey]Watchdog[/]           Ao desativar, instala a tarefa agendada 'IPV6Shutdown-Watchdog'");
-            AnsiConsole.MarkupLine("                     (a cada 2 min, como SYSTEM): se o WARP ou outro adaptador novo");
+            AnsiConsole.MarkupLine("                     (no boot + a cada 2 min, como SYSTEM): se o WARP ou outro adaptador novo");
             AnsiConsole.MarkupLine("                     reabilitar o IPv6, o binding é rebloqueado automaticamente.");
             AnsiConsole.MarkupLine("                     Removida no 'Reverter tudo'.");
             AnsiConsole.MarkupLine("  [grey]Tailscale[/]           As interfaces do Tailscale são sempre protegidas: o IPv6 privado");
@@ -1094,6 +1183,6 @@ namespace IPV6Shutdown
 
         private sealed record ExtraStatus(
             string Teredo, string SixToFour, string Isatap, string IpHttps,
-            int DisabledComponents, string IpHelper, string IpHelperStart, int FirewallRules, bool Watchdog);
+            int DisabledComponents, string IpHelper, string IpHelperStart, int FirewallRules);
     }
 }
