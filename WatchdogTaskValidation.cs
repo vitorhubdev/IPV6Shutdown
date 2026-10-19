@@ -30,6 +30,9 @@ namespace IPV6Shutdown
     /// <summary>Pure validation helpers for the scheduled watchdog task (unit-testable).</summary>
     internal static class WatchdogTaskValidation
     {
+        /// <summary>Marcador de versão embutido no script do watchdog (detecta tarefas instaladas por versões antigas).</summary>
+        internal const string ScriptMarker = "IPV6SHUTDOWN-WATCHDOG-V2";
+
         private const double TwoMinutes = 2.0;
         private const double IntervalToleranceMinutes = 0.02;
 
@@ -59,6 +62,27 @@ namespace IPV6Shutdown
             }
 
             return false;
+        }
+
+        internal static bool HasCurrentScript(string? actionArguments)
+        {
+            if (string.IsNullOrWhiteSpace(actionArguments))
+                return false;
+
+            string[] tokens = actionArguments.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            int idx = Array.FindIndex(tokens, t => t.Equals("-EncodedCommand", StringComparison.OrdinalIgnoreCase));
+            if (idx < 0 || idx + 1 >= tokens.Length)
+                return false;
+
+            try
+            {
+                string script = System.Text.Encoding.Unicode.GetString(Convert.FromBase64String(tokens[idx + 1].Trim('"')));
+                return script.Contains(ScriptMarker, StringComparison.Ordinal);
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
         }
 
         internal static bool IsIllegalWatchdogDuration(string? durationRaw)
@@ -116,6 +140,10 @@ namespace IPV6Shutdown
             if (!snapshot.ActionArguments.Contains("-EncodedCommand", StringComparison.OrdinalIgnoreCase))
                 return new(WatchdogConfigurationState.Invalid,
                     "ação não contém -EncodedCommand");
+
+            if (!HasCurrentScript(snapshot.ActionArguments))
+                return new(WatchdogConfigurationState.Invalid,
+                    "script desatualizado — reaplique com --disable");
 
             return new(WatchdogConfigurationState.Healthy, "configuração válida");
         }

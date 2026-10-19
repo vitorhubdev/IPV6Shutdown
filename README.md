@@ -37,13 +37,13 @@ Sites dual-stack (ex.: com registro A e AAAA) continuam acessíveis via IPv4 qua
 
 ## Recursos
 
-- Desativa binding `ms_tcpip6` em adaptadores (exceto Tailscale)
-- Regras de firewall IPv6 entrada/saída (exceto ULA Tailscale)
+- Desativa binding `ms_tcpip6` em adaptadores — **exceto VPNs/overlays** (Cloudflare WARP, Tailscale, WireGuard, OpenVPN/TAP, NordLynx, ProtonVPN…; extensível com `--protect`)
+- Regras de firewall IPv6 entrada/saída (nunca bloqueiam loopback, link-local, ULA do Tailscale nem a ULA/DNS local do Cloudflare WARP)
 - Tarefa agendada `IPV6Shutdown-Watchdog` (SYSTEM, Highest) no boot + a cada 2 min, com recuperação de execuções perdidas
 - **Prefer IPv4** (`DisabledComponents | 0x20`) no `--disable` — sem `0xFF` aqui
-- Modo **FULL** (`--full`): túneis de transição, `0xFF` e IP Helper (se sem Tailscale)
-- Reversão completa com `-e` / `--enable`
-- Status sem elevação (`-s` / `--status`)
+- Modo **FULL** (`--full`): túneis de transição, `0xFF` e IP Helper (se não houver VPN/overlay)
+- Reversão **fiel** com `-e` / `--enable`: restaura o estado salvo antes da primeira alteração
+- Status **real** sem elevação (`-s` / `--status`): bindings, endereços IPv6, regras de firewall efetivamente ativas, Windows Firewall, watchdog (inclusive última execução), reinício pendente e conexão do WARP
 - Interface em português (pt-BR)
 
 ## Download
@@ -74,11 +74,12 @@ Abre o menu (precisa de terminal com stdin). Sem argumentos em ambiente sem entr
 | Opção | Descrição |
 |-------|-----------|
 | *(sem args)* | Menu interativo (eleva via UAC) |
-| `--disable` | Bindings + firewall + Prefer IPv4 `0x20`; IPv6 Tailscale preservado |
-| `--full` | Como `--disable` + túneis + `0xFF` + IP Helper (se sem Tailscale) |
+| `--disable` | Bindings + firewall + Prefer IPv4 `0x20`; IPv6 de VPNs/overlays preservado |
+| `--full` | Como `--disable` + túneis + `0xFF` + IP Helper (se não houver VPN/overlay) |
 | `-e`, `--enable` | Reverte tudo (bindings, firewall, watchdog, `0x20`, etc.) |
 | `-s`, `--status` | Mostra status (não precisa de Admin) |
-| `--nofirewall` | Não cria regras de firewall (nem watchdog) |
+| `--nofirewall` | Não cria regras de firewall nem watchdog — e **remove** os que já existiam |
+| `--protect <texto>` | Preserva o IPv6 de adaptadores cujo nome/descrição contenham o texto (repetível; fica salvo e vale para o watchdog) |
 | `-h`, `--help` | Ajuda |
 
 Exemplos:
@@ -86,6 +87,7 @@ Exemplos:
 ```powershell
 IPV6Shutdown.exe --disable
 IPV6Shutdown.exe --full
+IPV6Shutdown.exe --disable --protect "MinhaVPN"
 IPV6Shutdown.exe -e
 IPV6Shutdown.exe -s
 ```
@@ -94,9 +96,10 @@ IPV6Shutdown.exe -s
 
 ### `--disable` (padrão)
 
-1. **Bindings** — `Disable-NetAdapterBinding` em `ms_tcpip6`, exceto adaptadores Tailscale
-2. **Firewall** — bloqueia IPv6 entrada/saída exceto ULA Tailscale (`AllIpv6SemUla` no código)
-3. **Watchdog** — tarefa `IPV6Shutdown-Watchdog` como SYSTEM (Highest), com trigger no boot + reconciliação a cada 2 min e `StartWhenAvailable`; reaplica bindings + firewall se WARP, reboot, atualização de driver ou novo adaptador reabilitar IPv6
+0. **Snapshot** — antes de qualquer alteração grava `%ProgramData%\IPV6Shutdown\state.json` (bindings que serão desativados, `DisabledComponents`, estado dos túneis e do IP Helper)
+1. **Bindings** — `Disable-NetAdapterBinding` em `ms_tcpip6`, exceto adaptadores de VPN/overlay (se algum estiver com IPv6 desligado, ele é religado: o WARP, por exemplo, usa IPv6 interno para o DNS local)
+2. **Firewall** — bloqueia IPv6 entrada/saída exceto loopback, link-local, ULA do Tailscale (`fd7a:115c:a1e0::/48`) e ULA do WARP (`fd01:db8:1111::/64`); as faixas são calculadas por `Ipv6Ranges`
+3. **Watchdog** — tarefa `IPV6Shutdown-Watchdog` como SYSTEM (Highest), com trigger no boot + reconciliação a cada 2 min e `StartWhenAvailable`; só age quando algo está errado e usa a mesma lista de VPNs protegidas — não "briga" com o WARP
 4. **Prefer IPv4** — grava `DisabledComponents = current | 0x20` (não usa `0xFF` aqui). **Reinício recomendado** para a pilha TCP/IP aplicar plenamente. Evita que sites dual-stack “travem” quando o DNS devolve AAAA mas IPv6 está bloqueado/desvinculado
 
 ### `--full`
@@ -104,16 +107,17 @@ IPV6Shutdown.exe -s
 Tudo do `--disable`, mais:
 
 - Desativa Teredo, 6to4, ISATAP, IP-HTTPS
-- **Sem Tailscale:** `DisabledComponents = 0xFF` + para/desabilita IP Helper (`iphlpsvc`) + firewall extra (Teredo UDP 3544, protocolo 41)
-- **Com Tailscale:** pula `0xFF` e IP Helper (Tailscale depende de `iphlpsvc`); ainda aplica `0x20` do `--disable`
+- **Sem VPN/overlay:** `DisabledComponents = 0xFF` + para/desabilita IP Helper (`iphlpsvc`)
+- **Com VPN/overlay (WARP, Tailscale…):** pula `0xFF` e IP Helper (VPNs dependem deles); ainda aplica `0x20` do `--disable`
+- Firewall extra (Teredo UDP 3544, protocolo 41)
 
-### Tailscale
+### VPNs e overlays (Cloudflare WARP, Tailscale, WireGuard…)
 
-Interfaces cujo nome ou descrição contém “Tailscale” mantêm IPv6 ativo. O firewall não bloqueia a faixa ULA privada do tailnet.
+Adaptadores cujo nome ou descrição casem com a lista conhecida (ou com `--protect`) **mantêm o IPv6** e o firewall não bloqueia as faixas internas deles. Assim o WARP continua conectando e resolvendo DNS (usa `fd01:db8:1111::2/3`), e o MagicDNS do Tailscale continua funcionando (o fallback `*.ts.net` no WARP é configurado automaticamente quando ambos existem).
 
 ### Reverter (`-e` / `--enable`)
 
-Remove watchdog, regras de firewall, reativa bindings, restaura túneis, limpa bit `0x20` em `DisabledComponents` (remove a propriedade se o valor fica 0 ou era `0xFF`), reativa IP Helper.
+Remove watchdog e regras de firewall e **restaura o estado original salvo no snapshot**: reativa só os bindings que a ferramenta desativou, devolve os túneis, `DisabledComponents` e o tipo de inicialização do IP Helper ao valor anterior. Sem snapshot (instalação anterior à v1.4.0) usa o comportamento legado e avisa.
 
 ## Compilar e testar
 

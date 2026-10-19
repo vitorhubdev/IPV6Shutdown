@@ -119,6 +119,29 @@ namespace IPV6Shutdown.Tests
             UserId: "SYSTEM",
             RunLevel: "Highest",
             ActionExecute: "powershell.exe",
-            ActionArguments: "-NoProfile -EncodedCommand AAAA");
+            ActionArguments: "-NoProfile -EncodedCommand " + EncodeScript(WatchdogTaskValidation.ScriptMarker));
+
+        private static string EncodeScript(string script) =>
+            Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
+
+        [Fact]
+        public void EvaluateConfiguration_flags_outdated_script()
+        {
+            WatchdogConfigurationResult result = WatchdogTaskValidation.EvaluateConfiguration(
+                HealthySnapshot() with { ActionArguments = "-NoProfile -EncodedCommand " + EncodeScript("Get-Date") });
+
+            Assert.Equal(WatchdogConfigurationState.Invalid, result.State);
+            Assert.Contains("desatualizado", result.Reason);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("-EncodedCommand")]
+        [InlineData("-EncodedCommand !!!nao-base64")]
+        public void HasCurrentScript_rejects_malformed_arguments(string? args)
+        {
+            Assert.False(WatchdogTaskValidation.HasCurrentScript(args));
+        }
     }
 }

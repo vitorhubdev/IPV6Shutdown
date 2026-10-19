@@ -17,12 +17,15 @@ namespace IPV6Shutdown
         private const string RuleEntrada = "IPV6Shutdown - Bloquear IPv6 (Entrada)";
         private const string RuleTeredo = "IPV6Shutdown - Bloquear Teredo (UDP 3544)";
         private const string Rule6in4 = "IPV6Shutdown - Bloquear 6in4 (Protocolo 41)";
-        private const string AllIpv6SemUla = "::-fd7a:115c:a1df:ffff:ffff:ffff:ffff:ffff,fd7a:115c:a1e1::-ffff:ffff:ffff:ffff:ffff:ffff:ffff";
         private const string RegPath = @"HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters";
         private const string WatchdogTaskName = "IPV6Shutdown-Watchdog";
         private const int PsTimeoutMs = 60_000;
         private const int BindingBatchSize = 40;
         private const int KillWaitMs = 5_000;
+
+        // Todo IPv6 exceto loopback, link-local e as ULAs de Tailscale/Cloudflare WARP (ver Ipv6Ranges).
+        private static readonly string BlockedRemote = Ipv6Ranges.BuildBlockedRanges(Ipv6Ranges.DefaultExclusions);
+        private static readonly string PowerShellExe = ResolvePowerShellPath();
 
         private static readonly HashSet<string> KnownArgs = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -31,26 +34,38 @@ namespace IPV6Shutdown
             "-w", "--warp-tailscale"
         };
 
+        private static List<string> _cliProtect = [];
+        private static OriginalState? _state;
+        private static bool _stateLoaded;
+        private static List<BindingInfo>? _bindingsCache;
+
         private static int Main(string[] args)
         {
             Console.Title = "IPV6Shutdown — bloqueio total de IPv6 | github.com/vitorhubdev";
             Console.OutputEncoding = Encoding.UTF8;
 
-            bool enable = args.Any(a => a is "-e" or "--enable");
-            bool statusOnly = args.Any(a => a is "-s" or "--status");
-            bool full = args.Any(a => a is "--full");
-            bool disable = args.Any(a => a is "--disable");
-            bool noFirewall = args.Any(a => a is "--nofirewall");
-            bool pause = args.Any(a => a is "--pause");
-            bool warpTailscale = args.Any(a => a is "-w" or "--warp-tailscale");
+            if (!TryParseArgs(args, out string[] flags, out List<string> protect))
+            {
+                ShowHelp();
+                return 1;
+            }
+            _cliProtect = protect;
 
-            if (args.Any(a => a is "-h" or "--help" or "/?"))
+            bool enable = flags.Any(a => a is "-e" or "--enable");
+            bool statusOnly = flags.Any(a => a is "-s" or "--status");
+            bool full = flags.Any(a => a is "--full");
+            bool disable = flags.Any(a => a is "--disable");
+            bool noFirewall = flags.Any(a => a is "--nofirewall");
+            bool pause = flags.Any(a => a is "--pause");
+            bool warpTailscale = flags.Any(a => a is "-w" or "--warp-tailscale");
+
+            if (flags.Any(a => a is "-h" or "--help" or "/?"))
             {
                 ShowHelp();
                 return 0;
             }
 
-            if (args.Length > 0 && args.Any(a => !KnownArgs.Contains(a)))
+            if (flags.Any(a => !KnownArgs.Contains(a)))
             {
                 ShowHelp();
                 return 1;
@@ -123,6 +138,88 @@ namespace IPV6Shutdown
             }
             return 0;
         }
+
+        /// <summary>Separa "--protect valor" / "--protect=valor" dos demais argumentos.</summary>
+        private static bool TryParseArgs(string[] args, out string[] flags, out List<string> protect)
+        {
+            var rest = new List<string>();
+            protect = [];
+            for (int i = 0; i < args.Length; i++)
+            {
+                string arg = args[i];
+                string value;
+                if (arg.Equals("--protect", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 >= args.Length)
+                    {
+                        flags = [.. rest];
+                        return false;
+                    }
+                    value = args[++i];
+                }
+                else if (arg.StartsWith("--protect=", StringComparison.OrdinalIgnoreCase))
+                {
+                    value = arg["--protect=".Length..];
+                }
+                else
+                {
+                    rest.Add(arg);
+                    continue;
+                }
+
+                if (!AdapterProtection.IsValidCustomPattern(value))
+                {
+                    flags = [.. rest];
+                    return false;
+                }
+                protect.Add(value.Trim().ToLowerInvariant());
+            }
+            flags = [.. rest];
+            return true;
+        }
+
+        private static string ResolvePowerShellPath()
+        {
+            // Caminho absoluto (programa roda elevado: nada de procurar powershell.exe no diretório do .exe/PATH).
+            // Processo de 32 bits em Windows de 64 bits usa Sysnative para obter o PowerShell de 64 bits.
+            string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string sub = Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess ? "Sysnative" : "System32";
+            string path = Path.Combine(windir, sub, "WindowsPowerShell", "v1.0", "powershell.exe");
+            return File.Exists(path) ? path : "powershell.exe";
+        }
+
+        private static OriginalState? GetState()
+        {
+            if (!_stateLoaded)
+            {
+                _state = OriginalState.Load();
+                _stateLoaded = true;
+            }
+            return _state;
+        }
+
+        private static void SetState(OriginalState? state)
+        {
+            _state = state;
+            _stateLoaded = true;
+        }
+
+        private static List<string> CustomProtect() =>
+            (GetState()?.CustomProtect ?? []).Concat(_cliProtect)
+                .Select(p => p.Trim().ToLowerInvariant())
+                .Where(AdapterProtection.IsValidCustomPattern)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+        private static IReadOnlyList<string> ProtectPatterns() => AdapterProtection.Normalize(CustomProtect());
+
+        private static string? ProtectionReason(BindingInfo b) =>
+            AdapterProtection.FindMatch(b.Name, b.Description, CustomProtect());
+
+        private static bool IsProtectedAdapter(BindingInfo b) => ProtectionReason(b) is not null;
+
+        private static bool HasProtectedVpn() =>
+            GetBindings().Any(IsProtectedAdapter) || GetTailscaleCliPath() != null || GetWarpCliPath() != null;
 
         private static int RunInteractive()
         {
@@ -244,7 +341,7 @@ namespace IPV6Shutdown
                 string newArgs = args is { Length: > 0 }
                     ? string.Join(' ', args.Where(a => a != "--pause").Select(QuoteArg)) + " --pause"
                     : "";
-                Process.Start(new ProcessStartInfo
+                using Process? elevated = Process.Start(new ProcessStartInfo
                 {
                     FileName = Environment.ProcessPath!,
                     Arguments = newArgs,
@@ -270,25 +367,51 @@ namespace IPV6Shutdown
 
         private static string GetAppVersion()
         {
-            Version? version = Assembly.GetExecutingAssembly().GetName().Version;
-            return version is null ? "1.3.1" : $"{version.Major}.{version.Minor}.{version.Build}";
+            Assembly assembly = Assembly.GetExecutingAssembly();
+            string? info = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            if (!string.IsNullOrWhiteSpace(info))
+                return info.Split('+')[0];
+            Version? version = assembly.GetName().Version;
+            return version is null ? "?" : $"{version.Major}.{version.Minor}.{version.Build}";
         }
 
         private static void RenderStatus()
         {
-            List<BindingInfo> bindings = GetBindings();
+            List<BindingInfo> bindings = GetBindings(fresh: true);
             ExtraStatus extra = GetExtraStatus();
+            OriginalState? state = OriginalState.Load();
+            SetState(state);
+            (WatchdogConfigurationState? watchdogState, string watchdogMarkup, bool watchdogLastRunFailed) = GetWatchdogStatus();
 
             var table = new Table().Border(TableBorder.Rounded).Title("[bold]Interfaces de rede[/]");
             table.AddColumn("Interface");
-            table.AddColumn("Descrição");
             table.AddColumn("IPv6");
+            table.AddColumn("End.");
+            table.AddColumn("Observação");
             foreach (BindingInfo b in bindings)
             {
-                string status = b.Enabled ? "[red]● ATIVO[/]" : "[green]● DESATIVADO[/]";
-                table.AddRow(Markup.Escape(b.Name), Markup.Escape(b.Description), status);
+                string? reason = ProtectionReason(b);
+                string status = b.Enabled
+                    ? (reason is null ? "[red]● ATIVO[/]" : "[yellow]● ATIVO (protegido)[/]")
+                    : "[green]● DESATIVADO[/]";
+                var notes = new List<string>();
+                if (reason is not null)
+                    notes.Add($"VPN/overlay ({reason})");
+                if (!b.Hardware)
+                    notes.Add("virtual");
+                if (!string.IsNullOrEmpty(b.Status) && !b.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
+                    notes.Add(b.Status.ToLowerInvariant());
+                table.AddRow(
+                    $"{Markup.Escape(b.Name)}\n[grey]{Markup.Escape(b.Description)}[/]",
+                    status,
+                    b.Ipv6Addresses.ToString(),
+                    Markup.Escape(string.Join(" · ", notes)));
             }
             AnsiConsole.Write(table);
+
+            int expectedRules = state is null ? extra.FirewallRules : state.Mode == "full" ? 4 : 2;
+            bool firewallEffective = extra.FirewallService == "Running" && extra.FirewallProfilesOff == 0;
+            bool rebootPending = IsRebootPending(state, extra);
 
             var grid = new Table().Border(TableBorder.Rounded).Title("[bold]Proteções extras[/]");
             grid.AddColumn("Item");
@@ -297,31 +420,107 @@ namespace IPV6Shutdown
             grid.AddRow("6to4", StateMarkup(extra.SixToFour));
             grid.AddRow("ISATAP", StateMarkup(extra.Isatap));
             grid.AddRow("IP-HTTPS", StateMarkup(extra.IpHttps));
-            grid.AddRow("DisabledComponents (registro)", DisabledComponentsPolicy.FormatStatusMarkup(extra.DisabledComponents));
+            grid.AddRow("DisabledComponents (registro)",
+                DisabledComponentsPolicy.FormatStatusMarkup(extra.DisabledComponents)
+                + (rebootPending ? " [yellow](reinício pendente)[/]" : ""));
             grid.AddRow("Serviço IP Helper (iphlpsvc)", extra.IpHelper == "Stopped"
                 ? $"[green]Parado ({Markup.Escape(extra.IpHelperStart)})[/]"
-                : $"[red]{Markup.Escape(extra.IpHelper)} ({Markup.Escape(extra.IpHelperStart)})[/]");
+                : $"[grey]{Markup.Escape(extra.IpHelper)} ({Markup.Escape(extra.IpHelperStart)})[/]");
             grid.AddRow("Regras de firewall IPV6Shutdown", extra.FirewallRules == 0
-                ? "[red]nenhuma[/]"
-                : $"[green]{extra.FirewallRules} regra(s) ativa(s)[/]");
-            grid.AddRow("Watchdog (proteção contínua)", GetWatchdogStatusMarkup());
-            if (HasTailscale() || HasCloudflareWarp())
+                ? "[grey]nenhuma[/]"
+                : extra.FirewallActive >= expectedRules
+                    ? $"[green]{extra.FirewallActive}/{expectedRules} ativa(s)[/]"
+                    : $"[yellow]{extra.FirewallActive}/{expectedRules} ativa(s) — incompleto[/]");
+            if (extra.FirewallRules > 0)
             {
-                grid.AddRow("Cloudflare WARP + Tailscale DNS", GetWarpTailscaleStatus());
+                grid.AddRow("Windows Firewall", firewallEffective
+                    ? "[green]ativo[/]"
+                    : extra.FirewallService != "Running"
+                        ? $"[red]serviço {Markup.Escape(extra.FirewallService)} — regras sem efeito[/]"
+                        : $"[yellow]{extra.FirewallProfilesOff} perfil(is) desativado(s) — regras sem efeito nele(s)[/]");
             }
+            grid.AddRow("Watchdog (proteção contínua)", watchdogMarkup);
+
+            List<string> protectedNames = bindings.Where(IsProtectedAdapter).Select(b => b.Name).ToList();
+            if (protectedNames.Count > 0 || GetTailscaleCliPath() != null || GetWarpCliPath() != null)
+            {
+                grid.AddRow("VPNs/overlays preservados", protectedNames.Count > 0
+                    ? $"[green]{Markup.Escape(string.Join(", ", protectedNames))}[/] [grey](IPv6 mantido)[/]"
+                    : "[grey]instalados, sem adaptador ativo[/]");
+            }
+            if (HasCloudflareWarp())
+                grid.AddRow("Cloudflare WARP (conexão)", GetWarpConnectionMarkup());
+            if (HasTailscale() || HasCloudflareWarp())
+                grid.AddRow("Cloudflare WARP + Tailscale DNS", GetWarpTailscaleStatus());
             AnsiConsole.Write(grid);
 
             AnsiConsole.WriteLine();
             int ativos = bindings.Count(b => b.Enabled);
-            int ativosNormais = bindings.Count(b => b.Enabled && !IsTailscaleAdapter(b));
-            AnsiConsole.MarkupLine(bindings.Count == 0
-                ? "[grey]IPv6: nenhuma interface com binding encontrada — status indisponível[/]"
-                : ativos == 0
+            int ativosNormais = bindings.Count(b => b.Enabled && !IsProtectedAdapter(b));
+
+            var warnings = new List<string>();
+            if (extra.FirewallRules > 0)
+            {
+                if (extra.FirewallActive < expectedRules)
+                    warnings.Add("regras de firewall incompletas ou desativadas");
+                if (!firewallEffective)
+                    warnings.Add("Windows Firewall desativado/parcial — as regras não têm efeito");
+                if (watchdogState is not null && watchdogState != WatchdogConfigurationState.Healthy)
+                    warnings.Add("watchdog fora do estado saudável");
+                else if (watchdogLastRunFailed)
+                    warnings.Add("última execução do watchdog falhou");
+            }
+            if (rebootPending)
+                warnings.Add("reinício pendente para o registro (DisabledComponents) valer");
+
+            if (bindings.Count == 0)
+            {
+                AnsiConsole.MarkupLine("[grey]IPv6: nenhuma interface com binding encontrada — status indisponível[/]");
+            }
+            else if (ativosNormais > 0)
+            {
+                AnsiConsole.MarkupLine($"[bold red]IPv6: ATIVO em {ativosNormais} interface(s) não protegida(s)[/]");
+            }
+            else if (warnings.Count > 0)
+            {
+                AnsiConsole.MarkupLine("[bold yellow]IPv6: bloqueado nas interfaces, com ressalvas:[/]");
+                foreach (string w in warnings)
+                    AnsiConsole.MarkupLine($"  [yellow]•[/] {Markup.Escape(w)}");
+            }
+            else
+            {
+                AnsiConsole.MarkupLine(ativos == 0
                     ? "[bold green]IPv6: BLOQUEADO em todas as interfaces[/]"
-                    : ativosNormais == 0
-                        ? "[bold green]IPv6: BLOQUEADO nas interfaces físicas[/] [grey](ativo apenas na Tailscale, protegida)[/]"
-                        : $"[bold red]IPv6: ATIVO em {ativos} interface(s)[/]");
+                    : $"[bold green]IPv6: BLOQUEADO nas interfaces comuns[/] [grey](ativo só em VPN/overlay preservada: {Markup.Escape(string.Join(", ", protectedNames))})[/]");
+            }
             AnsiConsole.WriteLine();
+        }
+
+        private static bool IsRebootPending(OriginalState? state, ExtraStatus extra) =>
+            state?.RegistryWrittenUtc is { } written
+            && DateTime.TryParse(extra.BootUtc, null, System.Globalization.DateTimeStyles.RoundtripKind, out DateTime boot)
+            && boot.ToUniversalTime() < written;
+
+        private static string GetWarpConnectionMarkup()
+        {
+            string? warpCli = GetWarpCliPath();
+            if (warpCli == null)
+                return "[grey]WARP CLI ausente[/]";
+            try
+            {
+                string output = RunPowerShell($"& '{EscapePs(warpCli)}' status 2>&1 | Out-String");
+                if (output.Contains("Disconnected", StringComparison.OrdinalIgnoreCase))
+                    return "[grey]Desconectado[/]";
+                if (output.Contains("Connecting", StringComparison.OrdinalIgnoreCase))
+                    return "[yellow]Conectando…[/]";
+                if (output.Contains("Connected", StringComparison.OrdinalIgnoreCase))
+                    return "[green]Conectado (IPv6 do túnel preservado)[/]";
+                return $"[grey]{Markup.Escape(Truncate(output, 60))}[/]";
+            }
+            catch (PowerShellException)
+            {
+                return "[grey]indisponível[/]";
+            }
         }
 
         private static string StateMarkup(string raw) =>
@@ -331,45 +530,133 @@ namespace IPV6Shutdown
                     ? "[grey]não presente[/]"
                     : $"[red]{Markup.Escape(raw)}[/]";
 
-        private static void DisableStandard(bool noFirewall)
+        private static OriginalState EnsureState(bool full)
+        {
+            OriginalState? state = OriginalState.Load();
+            if (state is null)
+            {
+                ExtraStatus extra = GetExtraStatus();
+                // Regras IPV6Shutdown sem snapshot = máquina já alterada por versão antiga: o original é desconhecido.
+                bool legacy = extra.FirewallRules > 0;
+                state = new OriginalState { OriginalKnown = !legacy };
+                if (!legacy)
+                {
+                    state.IpHelperStartType = NormalizeStartType(extra.IpHelperStart);
+                    state.IpHelperWasRunning = extra.IpHelper == "Running";
+                    state.DisabledComponentsPresent = extra.DisabledComponents != 0;
+                    state.DisabledComponentsValue = extra.DisabledComponents;
+                    foreach ((string key, string value) in new[]
+                    {
+                        ("Teredo", extra.Teredo), ("SixToFour", extra.SixToFour),
+                        ("Isatap", extra.Isatap), ("IpHttps", extra.IpHttps)
+                    })
+                    {
+                        if (IsSafeToken(value))
+                            state.Tunnels[key] = value;
+                    }
+                }
+            }
+
+            foreach (string pattern in _cliProtect)
+            {
+                if (!state.CustomProtect.Contains(pattern, StringComparer.OrdinalIgnoreCase))
+                    state.CustomProtect.Add(pattern);
+            }
+            if (full)
+                state.Mode = "full";
+
+            state.Save(); // grava antes de qualquer alteração: a reversão depende disso
+            SetState(state);
+            return state;
+        }
+
+        private static bool IsSafeToken(string? value) =>
+            !string.IsNullOrEmpty(value) && value != "?" && value.All(char.IsAsciiLetter);
+
+        private static string? NormalizeStartType(string value) =>
+            value is "Automatic" or "Manual" or "Disabled" ? value : null;
+
+        private static void RemoveEnforcement(StatusContext? ctx)
+        {
+            ctx?.Status("[grey]--nofirewall: removendo regras de firewall e watchdog anteriores...[/]");
+            RunPowerShell($"""
+                Stop-ScheduledTask -TaskName '{WatchdogTaskName}' -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName '{WatchdogTaskName}' -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-NetFirewallRule -DisplayName 'IPV6Shutdown*' -ErrorAction SilentlyContinue
+                """);
+        }
+
+        private static string BlockRuleCommand(string name, string direction) =>
+            $"New-NetFirewallRule -DisplayName '{name}' -Direction {direction} -Action Block -RemoteAddress '{BlockedRemote}' -Enabled True | Out-Null";
+
+        private static void DisableStandard(bool noFirewall, bool full = false)
         {
             bool preferIpv4RebootNeeded = false;
-            bool warpConflictFixed = false;
+            var protectedNames = new List<string>();
+            var reEnabledProtected = new List<string>();
             AnsiConsole.Status().Spinner(Spinner.Known.Dots).Start("[bold]Desativando IPv6...[/]", ctx =>
             {
-                List<BindingInfo> toDisable = GetBindings().Where(b => b.Enabled && !IsTailscaleAdapter(b)).ToList();
+                OriginalState state = EnsureState(full);
+                List<BindingInfo> bindings = GetBindings(fresh: true);
+                protectedNames.AddRange(bindings.Where(IsProtectedAdapter).Select(b => b.Name));
+
+                List<BindingInfo> toDisable = bindings.Where(b => b.Enabled && !IsProtectedAdapter(b)).ToList();
                 if (toDisable.Count > 0)
                 {
-                    foreach (BindingInfo b in toDisable)
-                        ctx.Status($"[grey]Desativando binding em[/] [bold]{Markup.Escape(b.Name)}[/]");
+                    ctx.Status($"[grey]Desativando binding em[/] [bold]{Markup.Escape(string.Join(", ", toDisable.Select(b => b.Name)))}[/]");
                     RunBindingCommands(toDisable.Select(b =>
                         $"Disable-NetAdapterBinding -Name '{EscapePs(b.Name)}' -ComponentID ms_tcpip6"));
                     AssertBindings(toDisable.Select(b => b.Name), shouldBeEnabled: false,
                         "Falha ao desativar IPv6 nas interfaces");
+                    foreach (BindingInfo b in toDisable)
+                    {
+                        if (!state.DisabledBindings.Contains(b.Name, StringComparer.OrdinalIgnoreCase))
+                            state.DisabledBindings.Add(b.Name);
+                    }
+                    state.Save();
                 }
-                ProtectTailscale(ctx);
+
+                reEnabledProtected.AddRange(ProtectAdapters(ctx));
+
                 ctx.Status("[grey]Gravando Prefer IPv4 (DisabledComponents | 0x20)...[/]");
-                preferIpv4RebootNeeded = ApplyPreferIpv4Registry();
+                preferIpv4RebootNeeded = ApplyPreferIpv4Registry(state);
                 if (HasTailscale() && HasCloudflareWarp())
                 {
-                    EnsureWarpTailscaleFallback(ctx, out warpConflictFixed);
+                    EnsureWarpTailscaleFallback(ctx, out _);
                 }
-                if (!noFirewall)
+
+                if (noFirewall)
                 {
-                    ctx.Status("[grey]Criando regras de firewall (IPv6 toda a faixa, exceto ULA do Tailscale)...[/]");
-                    EnsureFirewallRule(RuleSaida,
-                        $"New-NetFirewallRule -DisplayName '{RuleSaida}' -Direction Outbound -Action Block -RemoteAddress '{AllIpv6SemUla}' -Enabled True | Out-Null");
-                    EnsureFirewallRule(RuleEntrada,
-                        $"New-NetFirewallRule -DisplayName '{RuleEntrada}' -Direction Inbound -Action Block -RemoteAddress '{AllIpv6SemUla}' -Enabled True | Out-Null");
+                    RemoveEnforcement(ctx);
+                }
+                else
+                {
+                    ctx.Status("[grey]Criando regras de firewall (IPv6, exceto loopback/link-local/Tailscale/WARP)...[/]");
+                    EnsureFirewallRule(RuleSaida, BlockRuleCommand(RuleSaida, "Outbound"));
+                    EnsureFirewallRule(RuleEntrada, BlockRuleCommand(RuleEntrada, "Inbound"));
                     EnsureWatchdogInstalled(ctx);
                 }
+                state.Save();
             });
+
             AnsiConsole.MarkupLine("[green]✔ IPv6 desativado nas interfaces" + (noFirewall ? ".[/]" : " e bloqueado no firewall.[/]"));
+            if (protectedNames.Count > 0)
+            {
+                AnsiConsole.MarkupLine($"[green]✔ VPN/overlay preservada (IPv6 mantido):[/] {Markup.Escape(string.Join(", ", protectedNames))}");
+            }
+            if (reEnabledProtected.Count > 0)
+            {
+                AnsiConsole.MarkupLine($"[yellow]ℹ IPv6 reativado em VPN/overlay que o exige:[/] {Markup.Escape(string.Join(", ", reEnabledProtected))}");
+            }
             if (HasTailscale() && HasCloudflareWarp())
             {
-                AnsiConsole.MarkupLine("[green]✔ Conflito Cloudflare WARP + Tailscale MagicDNS resolvido (fallback *.ts.net ativo).[/]");
+                AnsiConsole.MarkupLine("[green]✔ Cloudflare WARP + Tailscale MagicDNS: fallback *.ts.net verificado.[/]");
             }
-            if (!noFirewall)
+            if (noFirewall)
+            {
+                AnsiConsole.MarkupLine("[grey]ℹ --nofirewall: regras de firewall e watchdog anteriores (se existiam) foram removidos.[/]");
+            }
+            else
             {
                 AnsiConsole.MarkupLine($"[green]✔ Proteção contínua ativa — a tarefa '[bold]{WatchdogTaskName}[/]' reaplica no boot e a cada 2 minutos.[/]");
             }
@@ -384,8 +671,9 @@ namespace IPV6Shutdown
 
         private static void DisableFull(bool noFirewall)
         {
-            DisableStandard(noFirewall);
+            DisableStandard(noFirewall, full: true);
 
+            OriginalState state = GetState() ?? EnsureState(full: true);
             bool regWritten = false;
             bool ipHelperSkipped = false;
             AnsiConsole.Status().Spinner(Spinner.Known.Dots).Start("[bold]Aplicando bloqueios extras...[/]", ctx =>
@@ -398,21 +686,22 @@ namespace IPV6Shutdown
                     Set-NetIPHttpsConfiguration -State Disabled -ErrorAction SilentlyContinue
                     """);
 
-                bool tailscale = HasTailscale();
-                if (tailscale)
+                bool vpn = HasProtectedVpn();
+                if (vpn)
                 {
-                    ctx.Status("[yellow]Pulando DisabledComponents=0xFF — desligaria o IPv6 do Tailscale[/]");
+                    ctx.Status("[yellow]Pulando DisabledComponents=0xFF — desligaria o IPv6 da VPN/overlay[/]");
                 }
                 else
                 {
                     ctx.Status("[grey]Gravando DisabledComponents = 0xFF no registro...[/]");
                     RunPowerShell($"Set-ItemProperty -Path '{RegPath}' -Name DisabledComponents -Value 255 -Type DWord");
+                    state.RegistryWrittenUtc = DateTime.UtcNow;
                     regWritten = true;
                 }
 
-                if (tailscale)
+                if (vpn)
                 {
-                    ctx.Status("[yellow]Pulando IP Helper — o serviço Tailscale depende de iphlpsvc e seria parado junto[/]");
+                    ctx.Status("[yellow]Pulando IP Helper — Tailscale/VPNs dependem de iphlpsvc[/]");
                     ipHelperSkipped = true;
                 }
                 else
@@ -429,6 +718,7 @@ namespace IPV6Shutdown
                     EnsureFirewallRule(Rule6in4,
                         $"New-NetFirewallRule -DisplayName '{Rule6in4}' -Direction Outbound -Action Block -Protocol 41 -Enabled True | Out-Null");
                 }
+                state.Save();
             });
 
             AnsiConsole.MarkupLine("[green]✔ Túneis de transição desativados" + (regWritten ? ", registro gravado" : "") + (ipHelperSkipped ? " e IP Helper preservado.[/]" : ", IP Helper parado.[/]"));
@@ -441,8 +731,8 @@ namespace IPV6Shutdown
             }
             else
             {
-                AnsiConsole.Write(new Panel("[bold yellow]DisabledComponents (0xFF) e o serviço IP Helper não foram alterados porque o Tailscale foi detectado: o primeiro desligaria o IPv6 privado do tailnet, e o segundo pararia o Tailscale (que depende do iphlpsvc). Nenhuma reinicialização é necessária por estes motivos.[/]")
-                    .Header("[bold]Modo FULL aplicado (Tailscale protegido)[/]")
+                AnsiConsole.Write(new Panel("[bold yellow]DisabledComponents (0xFF) e o serviço IP Helper não foram alterados porque uma VPN/overlay (Tailscale, Cloudflare WARP, WireGuard…) foi detectada: o primeiro desligaria o IPv6 privado dela, e o segundo pararia serviços que dependem do iphlpsvc. Nenhuma reinicialização é necessária por estes motivos.[/]")
+                    .Header("[bold]Modo FULL aplicado (VPN protegida)[/]")
                     .BorderColor(Color.Yellow));
             }
             AnsiConsole.WriteLine();
@@ -464,24 +754,45 @@ namespace IPV6Shutdown
         private static void InstallWatchdog(StatusContext? ctx)
         {
             ctx?.Status("[grey]Instalando tarefa de proteção contínua (a cada 2 min)...[/]");
+            string patternList = string.Join(", ", ProtectPatterns().Select(p => $"'{EscapePs(p)}'"));
+            string fullRules = GetState()?.Mode == "full"
+                ? $$"""
+                    Ensure-BlockRule '{{RuleTeredo}}' @{ Direction = 'Outbound'; Protocol = 'UDP'; RemotePort = '3544' }
+                    Ensure-BlockRule '{{Rule6in4}}' @{ Direction = 'Outbound'; Protocol = '41' }
+                    """
+                : string.Empty;
+
+            // O script só mexe no que está errado (bindings ativos fora da lista protegida, regras ausentes/desativadas)
+            // e usa a mesma lista de VPNs protegidas do aplicativo — assim não briga com WARP/Tailscale/etc.
             string script = $$"""
+                # {{WatchdogTaskValidation.ScriptMarker}}
                 $ErrorActionPreference = 'Continue'
+                $protect = @({{patternList}})
                 Get-NetAdapterBinding -ComponentID ms_tcpip6 | Where-Object {
-                    $_.Enabled -and
-                    $_.Name -notlike '*Tailscale*' -and
-                    $_.InterfaceDescription -notlike '*Tailscale*'
+                    if (-not $_.Enabled) { return $false }
+                    $text = ("$($_.Name) $($_.InterfaceDescription)").ToLowerInvariant()
+                    foreach ($p in $protect) { if ($text.Contains($p)) { return $false } }
+                    return $true
                 } | ForEach-Object {
                     Disable-NetAdapterBinding -Name $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
                 }
-                Remove-NetFirewallRule -DisplayName '{{RuleSaida}}' -ErrorAction SilentlyContinue
-                New-NetFirewallRule -DisplayName '{{RuleSaida}}' -Direction Outbound -Action Block -RemoteAddress '{{AllIpv6SemUla}}' -Enabled True | Out-Null
-                Remove-NetFirewallRule -DisplayName '{{RuleEntrada}}' -ErrorAction SilentlyContinue
-                New-NetFirewallRule -DisplayName '{{RuleEntrada}}' -Direction Inbound -Action Block -RemoteAddress '{{AllIpv6SemUla}}' -Enabled True | Out-Null
+                function Ensure-BlockRule($name, $extra) {
+                    $ok = @(Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' -and $_.Action -eq 'Block' })
+                    if ($ok.Count -gt 0) { return }
+                    Remove-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+                    $params = @{ DisplayName = $name; Action = 'Block'; Enabled = 'True' } + $extra
+                    New-NetFirewallRule @params | Out-Null
+                }
+                $remote = '{{BlockedRemote}}'
+                Ensure-BlockRule '{{RuleSaida}}' @{ Direction = 'Outbound'; RemoteAddress = $remote }
+                Ensure-BlockRule '{{RuleEntrada}}' @{ Direction = 'Inbound'; RemoteAddress = $remote }
+                {{fullRules}}
                 """;
             string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
             RunPowerShell($"""
                 Unregister-ScheduledTask -TaskName '{WatchdogTaskName}' -Confirm:$false -ErrorAction SilentlyContinue
-                $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}'
+                $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $action = New-ScheduledTaskAction -Execute $exe -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}'
                 $startupTrigger = New-ScheduledTaskTrigger -AtStartup
                 $periodicTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)
                 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
@@ -501,7 +812,10 @@ namespace IPV6Shutdown
             }
         }
 
-        private static WatchdogTaskSnapshot GetWatchdogTaskSnapshot()
+        private static WatchdogTaskSnapshot GetWatchdogTaskSnapshot() =>
+            GetWatchdogTaskSnapshot(out _);
+
+        private static WatchdogTaskSnapshot GetWatchdogTaskSnapshot(out WatchdogRunInfo run)
         {
             string json = RunPowerShell($$"""
                 $ErrorActionPreference = 'Stop'
@@ -519,6 +833,8 @@ namespace IPV6Shutdown
                         RunLevel = ''
                         ActionExecute = ''
                         ActionArguments = ''
+                        LastRun = ''
+                        LastResult = 0
                     } | ConvertTo-Json -Compress
                     return
                 }
@@ -542,6 +858,14 @@ namespace IPV6Shutdown
                 $actionExecute = if ($action) { [string]$action.Execute } else { '' }
                 $actionArguments = if ($action) { [string]$action.Arguments } else { '' }
 
+                $info = Get-ScheduledTaskInfo -InputObject $task -ErrorAction SilentlyContinue
+                $lastRun = ''
+                $lastResult = [int64]0
+                if ($info) {
+                    if ($info.LastRunTime) { $lastRun = $info.LastRunTime.ToString('s') }
+                    $lastResult = [int64]$info.LastTaskResult
+                }
+
                 [ordered]@{
                     Exists = $true
                     Enabled = ([string]$task.State -ne 'Disabled')
@@ -553,6 +877,8 @@ namespace IPV6Shutdown
                     RunLevel = [string]$task.Principal.RunLevel
                     ActionExecute = $actionExecute
                     ActionArguments = $actionArguments
+                    LastRun = $lastRun
+                    LastResult = $lastResult
                 } | ConvertTo-Json -Compress
                 """);
 
@@ -561,6 +887,9 @@ namespace IPV6Shutdown
             {
                 using JsonDocument doc = JsonDocument.Parse(json);
                 JsonElement root = doc.RootElement;
+                run = new WatchdogRunInfo(
+                    root.TryGetProperty("LastRun", out JsonElement lr) ? lr.GetString() ?? string.Empty : string.Empty,
+                    root.TryGetProperty("LastResult", out JsonElement res) && res.TryGetInt64(out long code) ? code : 0);
                 return new WatchdogTaskSnapshot(
                     root.GetProperty("Exists").GetBoolean(),
                     root.GetProperty("Enabled").GetBoolean(),
@@ -580,28 +909,37 @@ namespace IPV6Shutdown
             }
         }
 
-        private static string GetWatchdogStatusMarkup()
+        private static (WatchdogConfigurationState? State, string Markup, bool LastRunFailed) GetWatchdogStatus()
         {
             try
             {
                 WatchdogConfigurationResult result =
-                    WatchdogTaskValidation.EvaluateConfiguration(GetWatchdogTaskSnapshot());
+                    WatchdogTaskValidation.EvaluateConfiguration(GetWatchdogTaskSnapshot(out WatchdogRunInfo run));
 
-                return result.State switch
+                switch (result.State)
                 {
-                    WatchdogConfigurationState.Healthy =>
-                        "[green]ativa — boot + a cada 2 min[/]",
-                    WatchdogConfigurationState.Missing =>
-                        "[red]ausente[/]",
-                    WatchdogConfigurationState.Disabled =>
-                        "[red]desativada no Agendador de Tarefas[/]",
-                    _ =>
-                        $"[yellow]configuração inválida — {Markup.Escape(result.Reason)}[/]"
-                };
+                    case WatchdogConfigurationState.Healthy:
+                        // 0 = ok · 0x41303 = nunca executou · 0x41301 = executando · 0x41306 = encerrada pelo limite de tempo
+                        string last = run.LastResult switch
+                        {
+                            0 => $"última execução OK{(run.LastRun.Length > 0 ? $" ({Markup.Escape(run.LastRun.Replace('T', ' '))})" : "")}",
+                            0x41303 => "ainda não executou",
+                            0x41301 => "em execução agora",
+                            _ => $"[yellow]última execução falhou (0x{run.LastResult:X})[/]"
+                        };
+                        bool failed = run.LastResult is not (0 or 0x41303 or 0x41301);
+                        return (result.State, $"[green]ativa — boot + a cada 2 min[/] · {last}", failed);
+                    case WatchdogConfigurationState.Missing:
+                        return (result.State, "[grey]ausente[/]", false);
+                    case WatchdogConfigurationState.Disabled:
+                        return (result.State, "[red]desativada no Agendador de Tarefas[/]", false);
+                    default:
+                        return (result.State, $"[yellow]configuração inválida — {Markup.Escape(result.Reason)}[/]", false);
+                }
             }
             catch (PowerShellException ex)
             {
-                return $"[red]erro ao consultar — {Markup.Escape(ex.Message)}[/]";
+                return (null, $"[red]erro ao consultar — {Markup.Escape(ex.Message)}[/]", false);
             }
         }
 
@@ -621,8 +959,19 @@ namespace IPV6Shutdown
         private static void Revert()
         {
             bool rebootNeeded = false;
+            bool usedFallback = false;
             AnsiConsole.Status().Spinner(Spinner.Known.Dots).Start("[bold]Revertendo...[/]", ctx =>
             {
+                OriginalState? state = OriginalState.Load();
+                bool known = state is { OriginalKnown: true };
+                usedFallback = !known;
+
+                // Com snapshot: só reativa o que ESTA ferramenta desativou. Sem snapshot (versão antiga): comportamento legado.
+                List<BindingInfo> Candidates() => GetBindings(fresh: true)
+                    .Where(b => !b.Enabled
+                        && (!known || state!.DisabledBindings.Contains(b.Name, StringComparer.OrdinalIgnoreCase)))
+                    .ToList();
+
                 ctx.Status("[grey]Removendo tarefa de proteção contínua...[/]");
                 RunPowerShell($"""
                     Stop-ScheduledTask -TaskName '{WatchdogTaskName}' -ErrorAction SilentlyContinue
@@ -630,29 +979,45 @@ namespace IPV6Shutdown
                     """);
 
                 ctx.Status("[grey]Reativando bindings IPv6...[/]");
-                List<BindingInfo> disabled = GetBindings().Where(b => !b.Enabled).ToList();
+                List<BindingInfo> disabled = Candidates();
                 EnableBindings(disabled);
 
                 ctx.Status("[grey]Removendo regras de firewall...[/]");
                 RunPowerShell("Remove-NetFirewallRule -DisplayName 'IPV6Shutdown*' -ErrorAction SilentlyContinue");
 
                 ctx.Status("[grey]Restaurando túneis de transição...[/]");
-                RunPowerShell("""
-                    Set-NetTeredoConfiguration -Type Default -ErrorAction SilentlyContinue
-                    Set-Net6to4Configuration -State Default -ErrorAction SilentlyContinue
-                    Set-NetIsatapConfiguration -State Default -ErrorAction SilentlyContinue
-                    Set-NetIPHttpsConfiguration -State Default -ErrorAction SilentlyContinue
+                string TunnelValue(string key) =>
+                    known && state!.Tunnels.TryGetValue(key, out string? v) && IsSafeToken(v) ? v : "Default";
+                string teredo = TunnelValue("Teredo");
+                string sixToFour = TunnelValue("SixToFour");
+                string isatap = TunnelValue("Isatap");
+                string ipHttps = TunnelValue("IpHttps");
+                RunPowerShell($"""
+                    Set-NetTeredoConfiguration -Type {teredo} -ErrorAction SilentlyContinue
+                    Set-Net6to4Configuration -State {sixToFour} -ErrorAction SilentlyContinue
+                    Set-NetIsatapConfiguration -State {isatap} -ErrorAction SilentlyContinue
+                    Set-NetIPHttpsConfiguration -State {ipHttps} -ErrorAction SilentlyContinue
                     """);
 
                 ctx.Status("[grey]Restaurando registro DisabledComponents...[/]");
-                if (RevertPreferIpv4Registry())
+                if (RestoreDisabledComponents(known ? state : null))
                     rebootNeeded = true;
 
-                ctx.Status("[grey]Reativando serviço IP Helper...[/]");
-                RunPowerShell("Set-Service iphlpsvc -StartupType Manual; Start-Service iphlpsvc -ErrorAction SilentlyContinue");
+                ctx.Status("[grey]Restaurando serviço IP Helper...[/]");
+                string? ipHelperType = known ? NormalizeStartType(state!.IpHelperStartType ?? string.Empty) : null;
+                if (ipHelperType is not null)
+                {
+                    RunPowerShell($"Set-Service iphlpsvc -StartupType {ipHelperType}"
+                        + (state!.IpHelperWasRunning ? "; Start-Service iphlpsvc -ErrorAction SilentlyContinue" : ""));
+                }
+                else
+                {
+                    // Sem original conhecido: só mexe se o serviço estiver desabilitado (provável efeito do modo FULL antigo).
+                    RunPowerShell("if ((Get-Service iphlpsvc).StartType -eq 'Disabled') { Set-Service iphlpsvc -StartupType Automatic; Start-Service iphlpsvc -ErrorAction SilentlyContinue }");
+                }
 
                 ctx.Status("[grey]Reaplicando bindings IPv6 (replay contra watchdog em voo)...[/]");
-                List<BindingInfo> stillDisabled = GetBindings().Where(b => !b.Enabled).ToList();
+                List<BindingInfo> stillDisabled = Candidates();
                 EnableBindings(stillDisabled);
                 RunPowerShell("Remove-NetFirewallRule -DisplayName 'IPV6Shutdown*' -ErrorAction SilentlyContinue");
                 IEnumerable<string> replayNames = disabled.Select(b => b.Name)
@@ -660,17 +1025,53 @@ namespace IPV6Shutdown
                     .Distinct(StringComparer.OrdinalIgnoreCase);
                 AssertBindings(replayNames, shouldBeEnabled: true,
                     "Falha ao reativar IPv6 nas interfaces");
+
+                OriginalState.Delete();
+                SetState(null);
             });
 
             AnsiConsole.MarkupLine("[green]✔ IPv6 reativado, bloqueios e proteção contínua removidos.[/]");
+            if (usedFallback)
+            {
+                AnsiConsole.MarkupLine("[yellow]ℹ Nenhum snapshot do estado original foi encontrado (instalação anterior à v1.4.0): todos os bindings desativados foram reativados e os padrões do Windows restaurados.[/]");
+            }
             AnsiConsole.WriteLine();
             if (rebootNeeded)
             {
-                AnsiConsole.Write(new Panel("[bold yellow]O valor DisabledComponents foi removido do registro. Reinicie o computador para a pilha TCP/IP voltar ao padrão.[/]")
+                AnsiConsole.Write(new Panel("[bold yellow]O valor DisabledComponents foi restaurado no registro. Reinicie o computador para a pilha TCP/IP voltar ao estado original.[/]")
                     .Header("[bold]Reversão concluída[/]")
                     .BorderColor(Color.Yellow));
                 AnsiConsole.WriteLine();
             }
+        }
+
+        /// <summary>Restaura DisabledComponents ao valor original gravado; sem original, só desfaz o que a ferramenta grava (0x20/0xFF).</summary>
+        private static bool RestoreDisabledComponents(OriginalState? original)
+        {
+            int? current = ReadDisabledComponents();
+            if (current is null)
+                return false;
+
+            if (original is { DisabledComponentsPresent: true } o)
+            {
+                if (current == o.DisabledComponentsValue)
+                    return false;
+                if (current == (o.DisabledComponentsValue | DisabledComponentsPolicy.PreferIpv4)
+                    || current == DisabledComponentsPolicy.DisableAll)
+                {
+                    RunPowerShell($"Set-ItemProperty -Path '{RegPath}' -Name DisabledComponents -Value {o.DisabledComponentsValue} -Type DWord");
+                    return true;
+                }
+            }
+
+            (int? newValue, bool removeProperty, bool changed) = DisabledComponentsPolicy.RevertPreferIpv4(current.Value);
+            if (!changed)
+                return false;
+            if (removeProperty)
+                RunPowerShell($"Remove-ItemProperty -Path '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue");
+            else
+                RunPowerShell($"Set-ItemProperty -Path '{RegPath}' -Name DisabledComponents -Value {newValue!.Value} -Type DWord");
+            return true;
         }
 
         private static void EnableBindings(List<BindingInfo> adapters)
@@ -687,7 +1088,8 @@ namespace IPV6Shutdown
             return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
         }
 
-        private static string QuoteArg(string arg) => arg.Contains(' ') ? $"\"{arg}\"" : arg;
+        private static string QuoteArg(string arg) =>
+            arg.Length == 0 || arg.Contains(' ') ? $"\"{arg}\"" : arg;
 
         private static void SafePause()
         {
@@ -707,6 +1109,7 @@ namespace IPV6Shutdown
             List<string> list = commands.ToList();
             for (int i = 0; i < list.Count; i += BindingBatchSize)
                 RunPowerShell(string.Join(Environment.NewLine, list.Skip(i).Take(BindingBatchSize)));
+            InvalidateBindings();
         }
 
         private static void AssertBindings(IEnumerable<string> names, bool shouldBeEnabled, string failureMessage)
@@ -714,7 +1117,7 @@ namespace IPV6Shutdown
             var expected = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
             if (expected.Count == 0)
                 return;
-            List<string> mismatches = GetBindings()
+            List<string> mismatches = GetBindings(fresh: true)
                 .Where(b => expected.Contains(b.Name) && b.Enabled != shouldBeEnabled)
                 .Select(b => b.Name)
                 .ToList();
@@ -731,8 +1134,8 @@ namespace IPV6Shutdown
             string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
             var psi = new ProcessStartInfo
             {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -NonInteractive -EncodedCommand {encoded}",
+                FileName = PowerShellExe,
+                Arguments = $"-NoProfile -NonInteractive -NoLogo -EncodedCommand {encoded}",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -743,7 +1146,8 @@ namespace IPV6Shutdown
             Process process;
             try
             {
-                process = Process.Start(psi)!;
+                process = Process.Start(psi)
+                    ?? throw new PowerShellException(PsError.NotFound, "Não foi possível iniciar o powershell.exe.");
             }
             catch (Win32Exception ex)
             {
@@ -881,48 +1285,81 @@ namespace IPV6Shutdown
             return raw[start..];
         }
 
-        private static List<BindingInfo> GetBindings()
-        {
-            string json = RunPowerShell("Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Select-Object Name, InterfaceDescription, Enabled | ConvertTo-Json -Compress");
-            var list = new List<BindingInfo>();
-            if (string.IsNullOrWhiteSpace(json))
-                return list;
+        private static void InvalidateBindings() => _bindingsCache = null;
 
-            json = ExtractJsonPayload(json);
-            try
+        private static List<BindingInfo> GetBindings(bool fresh = false)
+        {
+            if (!fresh && _bindingsCache is not null)
+                return _bindingsCache;
+
+            string json = RunPowerShell("""
+                $ErrorActionPreference = 'SilentlyContinue'
+                $adapters = @{}
+                Get-NetAdapter | ForEach-Object { $adapters[$_.Name] = $_ }
+                $counts = @{}
+                Get-NetIPAddress -AddressFamily IPv6 | Where-Object {
+                    $_.IPAddress -notlike 'fe80*' -and $_.IPAddress -ne '::1' -and [string]$_.AddressState -eq 'Preferred'
+                } | Group-Object InterfaceAlias | ForEach-Object { $counts[$_.Name] = $_.Count }
+                Get-NetAdapterBinding -ComponentID ms_tcpip6 | ForEach-Object {
+                    $a = $adapters[$_.Name]
+                    [pscustomobject]@{
+                        Name = $_.Name
+                        InterfaceDescription = $_.InterfaceDescription
+                        Enabled = [bool]$_.Enabled
+                        Hardware = [bool]($a -and $a.HardwareInterface)
+                        Status = $(if ($a) { [string]$a.Status } else { '' })
+                        Ipv6 = [int]$counts[$_.Name]
+                    }
+                } | ConvertTo-Json -Compress
+                """);
+            var list = new List<BindingInfo>();
+            if (!string.IsNullOrWhiteSpace(json))
             {
-                using JsonDocument doc = JsonDocument.Parse(json);
-                if (doc.RootElement.ValueKind == JsonValueKind.Array)
-                    list.AddRange(doc.RootElement.EnumerateArray().Select(ParseBinding));
-                else if (doc.RootElement.ValueKind == JsonValueKind.Object)
-                    list.Add(ParseBinding(doc.RootElement));
+                json = ExtractJsonPayload(json);
+                try
+                {
+                    using JsonDocument doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                        list.AddRange(doc.RootElement.EnumerateArray().Select(ParseBinding));
+                    else if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                        list.Add(ParseBinding(doc.RootElement));
+                }
+                catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
+                {
+                    throw new PowerShellException(PsError.ExitCode,
+                        $"JSON de bindings inválido: {ex.Message}", ex);
+                }
             }
-            catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
-            {
-                throw new PowerShellException(PsError.ExitCode,
-                    $"JSON de bindings inválido: {ex.Message}", ex);
-            }
-            return list.OrderBy(b => b.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            _bindingsCache = list.OrderBy(b => b.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            return _bindingsCache;
         }
 
         private static BindingInfo ParseBinding(JsonElement el) =>
             new(el.GetProperty("Name").GetString() ?? string.Empty,
                 el.GetProperty("InterfaceDescription").GetString() ?? string.Empty,
-                el.GetProperty("Enabled").GetBoolean());
+                el.GetProperty("Enabled").GetBoolean(),
+                el.TryGetProperty("Hardware", out JsonElement hw) && hw.ValueKind == JsonValueKind.True,
+                el.TryGetProperty("Status", out JsonElement st) ? st.GetString() ?? string.Empty : string.Empty,
+                el.TryGetProperty("Ipv6", out JsonElement ips) && ips.TryGetInt32(out int n) ? n : 0);
 
         private static ExtraStatus GetExtraStatus()
         {
-            string json = RunPowerShell("""
+            string json = RunPowerShell($$"""
                 $ErrorActionPreference = 'SilentlyContinue'
+                $rules = @(Get-NetFirewallRule -DisplayName 'IPV6Shutdown*')
                 $o = [ordered]@{
                   Teredo = "$((Get-NetTeredoConfiguration).Type)"
                   SixToFour = "$((Get-Net6to4Configuration).State)"
                   Isatap = "$((Get-NetIsatapConfiguration).State)"
                   IpHttps = "$((Get-NetIPHttpsConfiguration).State)"
-                  DisabledComponents = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' -Name DisabledComponents -ErrorAction SilentlyContinue).DisabledComponents
+                  DisabledComponents = (Get-ItemProperty '{{RegPath}}' -Name DisabledComponents).DisabledComponents
                   IpHelper = "$((Get-Service iphlpsvc).Status)"
                   IpHelperStart = "$((Get-Service iphlpsvc).StartType)"
-                  FirewallRules = @(Get-NetFirewallRule -DisplayName 'IPV6Shutdown*' -ErrorAction SilentlyContinue).Count
+                  FirewallRules = $rules.Count
+                  FirewallActive = @($rules | Where-Object { [string]$_.Enabled -eq 'True' -and [string]$_.Action -eq 'Block' }).Count
+                  FirewallProfilesOff = @(Get-NetFirewallProfile | Where-Object { [string]$_.Enabled -eq 'False' }).Count
+                  FirewallService = "$((Get-Service mpssvc).Status)"
+                  BootUtc = "$((Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o'))"
                 }
                 $o | ConvertTo-Json -Compress
                 """);
@@ -940,7 +1377,11 @@ namespace IPV6Shutdown
                     dc.ValueKind == JsonValueKind.Number && dc.TryGetInt32(out int disabledComponentsValue) ? disabledComponentsValue : 0,
                     r.GetProperty("IpHelper").GetString() ?? "?",
                     r.GetProperty("IpHelperStart").GetString() ?? "?",
-                    r.GetProperty("FirewallRules").GetInt32());
+                    r.GetProperty("FirewallRules").GetInt32(),
+                    r.GetProperty("FirewallActive").GetInt32(),
+                    r.GetProperty("FirewallProfilesOff").GetInt32(),
+                    r.GetProperty("FirewallService").GetString() ?? "?",
+                    r.GetProperty("BootUtc").GetString() ?? string.Empty);
             }
             catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
             {
@@ -949,47 +1390,23 @@ namespace IPV6Shutdown
             }
         }
 
-        private static bool ApplyPreferIpv4Registry()
+        private static bool ApplyPreferIpv4Registry(OriginalState state)
         {
-            int current = ReadDisabledComponents();
+            int current = ReadDisabledComponents() ?? 0;
             (int newValue, bool newlySet) = DisabledComponentsPolicy.ApplyPreferIpv4(current);
             if (!newlySet)
                 return false;
             RunPowerShell($"Set-ItemProperty -Path '{RegPath}' -Name DisabledComponents -Value {newValue} -Type DWord");
+            state.RegistryWrittenUtc = DateTime.UtcNow;
             return true;
         }
 
-        private static bool RevertPreferIpv4Registry()
+        /// <summary>Valor atual de DisabledComponents, ou null se o valor não existe no registro.</summary>
+        private static int? ReadDisabledComponents()
         {
-            int current = ReadDisabledComponents();
-            if (!GetDisabledComponentsPropertyExists())
-                return false;
-
-            (int? newValue, bool removeProperty, bool changed) = DisabledComponentsPolicy.RevertPreferIpv4(current);
-            if (!changed)
-                return false;
-
-            if (removeProperty)
-                RunPowerShell($"Remove-ItemProperty -Path '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue");
-            else
-                RunPowerShell($"Set-ItemProperty -Path '{RegPath}' -Name DisabledComponents -Value {newValue!.Value} -Type DWord");
-            return true;
-        }
-
-        private static bool GetDisabledComponentsPropertyExists()
-        {
-            string check = RunPowerShell(
-                $"if (Get-ItemProperty '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue) {{ 'yes' }}");
-            return check.Contains("yes", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static int ReadDisabledComponents()
-        {
-            if (!GetDisabledComponentsPropertyExists())
-                return 0;
             string raw = RunPowerShell(
-                $"(Get-ItemProperty '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue).DisabledComponents");
-            return int.TryParse(raw.Trim(), out int value) ? value : 0;
+                $"$v = (Get-ItemProperty '{RegPath}' -Name DisabledComponents -ErrorAction SilentlyContinue).DisabledComponents; if ($null -ne $v) {{ [int]$v }}");
+            return int.TryParse(raw.Trim(), out int value) ? value : null;
         }
 
         private static void EnsureFirewallRule(string displayName, string createCommand)
@@ -1135,17 +1552,18 @@ namespace IPV6Shutdown
             }
         }
 
-        private static bool ProtectTailscale(StatusContext? ctx)
+        /// <summary>Garante o IPv6 ligado nas VPNs/overlays protegidas (WARP, Tailscale…). Retorna as que precisaram ser religadas.</summary>
+        private static List<string> ProtectAdapters(StatusContext? ctx)
         {
-            List<BindingInfo> tailscale = GetBindings().Where(IsTailscaleAdapter).ToList();
-            if (tailscale.Count == 0)
-                return false;
-            ctx?.Status($"[grey]Mantendo IPv6 na interface Tailscale[/] [bold]{Markup.Escape(tailscale[0].Name)}[/]");
-            RunBindingCommands(tailscale.Select(b =>
+            List<BindingInfo> off = GetBindings(fresh: true).Where(b => IsProtectedAdapter(b) && !b.Enabled).ToList();
+            if (off.Count == 0)
+                return [];
+            ctx?.Status($"[grey]Mantendo IPv6 na VPN/overlay[/] [bold]{Markup.Escape(off[0].Name)}[/]");
+            RunBindingCommands(off.Select(b =>
                 $"Enable-NetAdapterBinding -Name '{EscapePs(b.Name)}' -ComponentID ms_tcpip6"));
-            AssertBindings(tailscale.Select(b => b.Name), shouldBeEnabled: true,
-                "Falha ao preservar IPv6 na interface Tailscale");
-            return true;
+            AssertBindings(off.Select(b => b.Name), shouldBeEnabled: true,
+                "Falha ao preservar IPv6 na VPN/overlay");
+            return off.Select(b => b.Name).ToList();
         }
 
         private static void ShowHelp()
@@ -1162,15 +1580,21 @@ namespace IPV6Shutdown
             AnsiConsole.MarkupLine("                     de DNS (*.ts.net + ts.net) no WARP para o MagicDNS funcionar.");
             AnsiConsole.MarkupLine("  [grey]-e, --enable[/]       Reverte tudo: reativa o IPv6 e remove todos os bloqueios.");
             AnsiConsole.MarkupLine("  [grey]-s, --status[/]       Apenas mostra o status (não precisa de Administrador).");
-            AnsiConsole.MarkupLine("  [grey]--nofirewall[/]       Não cria regras de firewall.");
+            AnsiConsole.MarkupLine("  [grey]--nofirewall[/]       Não cria regras de firewall nem watchdog (e remove os anteriores).");
+            AnsiConsole.MarkupLine("  [grey]--protect <texto>[/]  Preserva o IPv6 de adaptadores cujo nome/descrição contenham o texto");
+            AnsiConsole.MarkupLine("                     (pode repetir; fica salvo e vale também para o watchdog).");
+            AnsiConsole.MarkupLine("                     Já protegidos: Tailscale, Cloudflare WARP, WireGuard, OpenVPN/TAP, NordLynx,");
+            AnsiConsole.MarkupLine("                     ProtonVPN, Mullvad, ZeroTier, AnyConnect, GlobalProtect e outros.");
             AnsiConsole.MarkupLine("  [grey]Watchdog[/]           Ao desativar, instala a tarefa agendada 'IPV6Shutdown-Watchdog'");
             AnsiConsole.MarkupLine("                     (no boot + a cada 2 min, como SYSTEM): se o WARP ou outro adaptador novo");
             AnsiConsole.MarkupLine("                     reabilitar o IPv6, o binding é rebloqueado automaticamente.");
             AnsiConsole.MarkupLine("                     Removida no 'Reverter tudo'.");
-            AnsiConsole.MarkupLine("  [grey]Tailscale[/]           As interfaces do Tailscale são sempre protegidas: o IPv6 privado");
-            AnsiConsole.MarkupLine("                     (fd7a:115c:a1e0::/48) do tailnet não é desativado, e no modo FULL");
-            AnsiConsole.MarkupLine("                     o DisabledComponents=0xFF e o IP Helper são pulados (o Tailscale");
-            AnsiConsole.MarkupLine("                     depende do serviço iphlpsvc).");
+            AnsiConsole.MarkupLine("  [grey]VPNs[/]                As interfaces de VPN/overlay são sempre preservadas. O firewall nunca bloqueia");
+            AnsiConsole.MarkupLine("                     loopback, link-local, a ULA do Tailscale (fd7a:115c:a1e0::/48) nem a do");
+            AnsiConsole.MarkupLine("                     Cloudflare WARP (fd01:db8:1111::/64, DNS local). No modo FULL, com VPN presente,");
+            AnsiConsole.MarkupLine("                     DisabledComponents=0xFF e IP Helper são pulados (dependências de VPN).");
+            AnsiConsole.MarkupLine("  [grey]Reverter[/]            Restaura o estado salvo antes da 1ª alteração (bindings, túneis, registro,");
+            AnsiConsole.MarkupLine("                     IP Helper), em %ProgramData%\\IPV6Shutdown\\state.json.");
             AnsiConsole.MarkupLine("  [grey]WARP + Tailscale[/]    Se ambos estiverem instalados, o fallback para *.ts.net e ts.net");
             AnsiConsole.MarkupLine("                     é configurado automaticamente no Cloudflare WARP, liberando o MagicDNS.");
             AnsiConsole.MarkupLine("  [grey]-h, --help[/]         Mostra esta ajuda.");
@@ -1179,10 +1603,14 @@ namespace IPV6Shutdown
             AnsiConsole.WriteLine();
         }
 
-        private sealed record BindingInfo(string Name, string Description, bool Enabled);
+        private sealed record BindingInfo(
+            string Name, string Description, bool Enabled, bool Hardware, string Status, int Ipv6Addresses);
+
+        private sealed record WatchdogRunInfo(string LastRun, long LastResult);
 
         private sealed record ExtraStatus(
             string Teredo, string SixToFour, string Isatap, string IpHttps,
-            int DisabledComponents, string IpHelper, string IpHelperStart, int FirewallRules);
+            int DisabledComponents, string IpHelper, string IpHelperStart, int FirewallRules,
+            int FirewallActive, int FirewallProfilesOff, string FirewallService, string BootUtc);
     }
 }

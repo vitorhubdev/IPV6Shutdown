@@ -5,6 +5,27 @@ Todas as alterações notáveis neste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [1.4.0] - 2026-10-19
+
+### Corrigido
+- `--nofirewall` agora remove o watchdog e as regras existentes (antes o watchdog recriava as regras em até 2 min).
+- "Reverter tudo" reativa apenas os bindings que a ferramenta desativou e restaura `DisabledComponents`, túneis e o tipo de inicialização do IP Helper ao valor original (antes forçava `Manual`), a partir de um snapshot em `%ProgramData%\IPV6Shutdown\state.json`.
+- Versão exibida vem do assembly (sem número duplicado no código).
+- `powershell.exe` é chamado por caminho absoluto (e por `Sysnative` no build de 32 bits).
+
+### Adicionado
+- **Compatibilidade com VPNs/overlays:** Cloudflare WARP, WireGuard, OpenVPN/TAP, NordLynx, ProtonVPN, Mullvad, ZeroTier e outros (além do Tailscale) têm o IPv6 preservado; `--protect <texto>` adiciona padrões próprios.
+- O firewall não bloqueia mais loopback, link-local nem a ULA do WARP (`fd01:db8:1111::/64`, DNS local) além da ULA do Tailscale; faixas calculadas por `Ipv6Ranges`.
+- Status real: endereços IPv6 por interface, regras ativas/esperadas, estado do Windows Firewall, última execução do watchdog, script do watchdog desatualizado, reinício pendente, conexão do WARP e veredito com ressalvas.
+- Testes para faixas IPv6, proteção de adaptadores e snapshot.
+
+### Alterado
+- Watchdog só recria regras ausentes/desativadas e respeita a lista de VPNs protegidas; no modo FULL também garante as regras de Teredo/6in4.
+- Menos chamadas ao PowerShell (cache de bindings por operação, status extra em uma consulta).
+- Modo FULL pula `0xFF` e IP Helper quando qualquer VPN/overlay é detectada (antes só Tailscale).
+
+---
+
 ## [1.3.1] - 2026-09-02
 
 ### Corrigido
